@@ -1,0 +1,21 @@
+[package]
+name = "dtu_core"
+version = "0.1.0"
+edition = "2021"
+description = "dtu core: identity, trust, transfer protocol, daemon and the REST control surface"
+
+[lib]
+name = "dtu_core"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
