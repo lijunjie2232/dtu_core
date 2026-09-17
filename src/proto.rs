@@ -110,3 +110,95 @@ pub struct Seen {
     pub trusted: bool,
 }
 
+pub async fn write_json<W, T>(w: &mut W, v: &T) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let body = serde_json::to_vec(v).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if body.len() > MAX_CTRL {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control frame too large"));
+    }
+    w.write_all(&(body.len() as u32).to_le_bytes()).await?;
+    w.write_all(&body).await?;
+    w.flush().await
+}
+
+pub async fn read_json<R, T>(r: &mut R) -> std::io::Result<T>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    let mut head = [0u8; 4];
+    r.read_exact(&mut head).await?;
+    let n = u32::from_le_bytes(head) as usize;
+    if n > MAX_CTRL {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "control frame too large"));
+    }
+    let mut body = vec![0u8; n];
+    r.read_exact(&mut body).await?;
+    serde_json::from_slice(&body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, m: &Msg) -> std::io::Result<()> {
+    write_json(w, m).await
+}
+
+pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Msg> {
+    read_json(r).await
+}
+
+/// Send one data chunk (`Data{len}` + bytes). Empty slice = end-of-stream marker.
+pub async fn send_data<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> std::io::Result<()> {
+    if buf.len() as u64 > MAX_DATA {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "chunk too large"));
+    }
+    write_msg(w, &Msg::Data { len: buf.len() as u64 }).await?;
+    if !buf.is_empty() {
+        w.write_all(buf).await?;
+        w.flush().await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn frames_survive_partial_and_batched_reads() {
+        let (mut a, mut b) = tokio::io::duplex(16);
+        let writer = tokio::spawn(async move {
+            write_msg(&mut a, &Msg::Ok).await.unwrap();
+            write_msg(&mut a, &Msg::List { path: "dir".into() }).await.unwrap();
+            write_msg(&mut a, &Msg::PutBegin { path: "x".into(), size: 10, offset: 0, len: 10, truncate: false })
+                .await
+                .unwrap();
+            send_data(&mut a, b"hello").await.unwrap();
+        });
+        assert!(matches!(read_msg(&mut b).await.unwrap(), Msg::Ok));
+        assert!(matches!(read_msg(&mut b).await.unwrap(), Msg::List { .. }));
+        assert!(matches!(read_msg(&mut b).await.unwrap(), Msg::PutBegin { size: 10, .. }));
+        match read_msg(&mut b).await.unwrap() {
+            Msg::Data { len } => {
+                assert_eq!(len, 5);
+                let mut buf = vec![0u8; 5];
+                b.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello");
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_rejected() {
+        let (mut a, mut b) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            let _ = a.write_all(&((MAX_CTRL as u32) + 1).to_le_bytes()).await;
+        });
+        let err = read_msg(&mut b).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
