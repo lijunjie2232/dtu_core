@@ -79,3 +79,94 @@ pub fn mtime_of(t: Option<std::time::SystemTime>) -> u64 {
     t.and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Streamed sha256 of a file, base64url encoded. Used to verify a transfer end to end.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut f = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(crate::identity::b64e(&hasher.finalize()))
+}
+
+/// Recursively list files under `base`, paths relative to `base` with `/` separators.
+/// Symlinks are skipped: simpler than proving every link stays inside the root.
+pub fn walk(base: &Path) -> io::Result<Vec<Entry>> {
+    let mut out = Vec::new();
+    let md = std::fs::symlink_metadata(base)?;
+    if md.is_file() {
+        out.push(Entry { path: rel_string(base_parent(base), base), size: md.len(), mtime: mtime(&md), dir: false });
+        return Ok(out);
+    }
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for item in std::fs::read_dir(&dir)? {
+            let item = item?;
+            let ft = item.file_type()?;
+            if ft.is_symlink() {
+                continue;
+            }
+            let p = item.path();
+            if ft.is_dir() {
+                // kept so that empty directories survive a sync
+                out.push(Entry {
+                    path: rel_string(base, &p),
+                    size: 0,
+                    mtime: mtime(&item.metadata()?),
+                    dir: true,
+                });
+                stack.push(p);
+            } else if ft.is_file() {
+                if is_part(item.file_name().as_os_str()) {
+                    continue;
+                }
+                let md = item.metadata()?;
+                out.push(Entry { path: rel_string(base, &p), size: md.len(), mtime: mtime(&md), dir: false });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn base_parent(p: &Path) -> &Path {
+    p.parent().unwrap_or(Path::new(""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_escapes() {
+        let root = std::env::temp_dir().join("dtu-guard-root");
+        std::fs::create_dir_all(&root).unwrap();
+        for bad in ["../x", "a/../../b", "C:\\Windows\\system32", "/etc/passwd", ".."] {
+            assert!(resolve(&root, bad).is_err(), "should reject {bad:?}");
+        }
+        assert!(resolve(&root, "a/b.txt").is_ok());
+        assert!(resolve(&root, "a//b.txt").is_ok());
+        assert!(resolve(&root, "./a/b.txt").is_ok());
+        assert_eq!(resolve(&root, "").unwrap(), root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn walk_lists_relative_paths() {
+        let root = std::env::temp_dir().join(format!("dtu-walk-{}", crate::identity::random_id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"bb").unwrap();
+        let e = walk(&root).unwrap();
+        let got: Vec<(&str, u64)> = e.iter().filter(|x| !x.dir).map(|x| (x.path.as_str(), x.size)).collect();
+        assert_eq!(got, vec![("a.txt", 3), ("sub/b.txt", 2)]);
+        assert_eq!(e.iter().filter(|x| x.dir).count(), 1, "the sub directory should be reported");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
