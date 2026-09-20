@@ -229,3 +229,215 @@ async fn bind_dual(port: u16) -> Result<Vec<TcpListener>, String> {
     Ok(out)
 }
 
+async fn handle(mut s: TcpStream, peer: SocketAddr, st: Arc<State>) -> Result<(), String> {
+    let addr = peer.to_string();
+    let ip = peer.ip().to_canonical();
+    let _ = s.set_nodelay(true);
+    let hello = tokio::time::timeout(HANDSHAKE, proto::read_msg(&mut s))
+        .await
+        .map_err(|_| "handshake timeout".to_string())?
+        .map_err(|e| e.to_string())?;
+    // Invitations are the one unauthenticated entry point: they *create* trust.
+    // They still have to speak our wire version, or the pair would be unusable.
+    if let Msg::Invite { proto: peer_proto, from, pubkey, expires_at, note, port } = hello {
+        if peer_proto != proto::PROTO {
+            let reason = format!(
+                "protocol mismatch: peer speaks v{peer_proto}, this device speaks v{} — upgrade the older side",
+                proto::PROTO
+            );
+            crate::audit::log("invite", "deny", "proto", Some(&from), &addr, Some(&reason));
+            let reply = Msg::Err { code: "protocol".into(), msg: reason };
+            let _ = proto::write_msg(&mut s, &reply).await;
+            return Ok(());
+        }
+        let inv = invite::Invite {
+            from,
+            pubkey,
+            expires_at,
+            note,
+            // The socket address is ephemeral; keep the port the peer advertised.
+            dial: invite::dialable(&addr, port),
+        };
+        return invite::handle(st, &mut s, addr, inv).await;
+    }
+    let Msg::Hello { proto: peer_proto, id, pubkey, cred, .. } = hello else {
+        return Err("expected hello".into());
+    };
+    if peer_proto != proto::PROTO {
+        let reason = format!(
+            "protocol mismatch: peer speaks v{peer_proto}, this device speaks v{} — upgrade the older side",
+            proto::PROTO
+        );
+        crate::audit::log("auth", "deny", "proto", Some(&id), &addr, Some(&reason));
+        let _ = proto::write_msg(&mut s, &Msg::AuthFail { reason }).await;
+        return Ok(());
+    }
+    let method = cred_method(&cred);
+
+    if let Err(reason) = authenticate(&st, &id, &pubkey, &cred, ip).await {
+        crate::audit::log("auth", "deny", method, Some(&id), &addr, Some(&reason));
+        let _ = proto::write_msg(&mut s, &Msg::AuthFail { reason }).await;
+        return Ok(());
+    }
+    crate::audit::log("auth", "ok", method, Some(&id), &addr, None);
+
+    if st.cfg.code_rotate_on_connect && !st.cfg.unlimit {
+        st.rotate_code(None).await;
+    }
+
+    // Proof of *our* identity for the client to pin, and reusable for the other
+    // connections of the same transfer (see Cred::Session).
+    let ttl = if st.cfg.session_ttl > 0 { st.cfg.session_ttl } else { 60 };
+    let token = jwt::sign(&st.id, &id, identity::now() + ttl);
+    let ok = Msg::HelloOk { proto: proto::PROTO, id: st.id.id.clone(), pubkey: st.id.pubkey(), token };
+    proto::write_msg(&mut s, &ok).await.map_err(|e| e.to_string())?;
+
+    let idle = idle_of(&st);
+    loop {
+        let msg = match next_msg(&mut s, idle, "op").await {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+        let res = match msg {
+            Msg::PutBegin { path, size, offset, len, truncate } => {
+                put(&mut s, &st, &path, size, offset, len, truncate).await
+            }
+            Msg::PutEnd { path, size, mtime, sha256 } => {
+                put_end(&mut s, &st, &path, size, mtime, sha256).await
+            }
+            Msg::GetBegin { path, offset, len } => get(&mut s, &st, &path, offset, len).await,
+            Msg::List { path } => list(&mut s, &st, &path).await,
+            Msg::Map { path } => map_ranges(&mut s, &st, &path).await,
+            Msg::Mkdir { path } => mkdir(&mut s, &st, &path).await,
+            Msg::Stat { path } => stat(&mut s, &st, &path).await,
+            Msg::Del { path } => del(&mut s, &st, &path).await,
+            other => Err(format!("unexpected frame: {other:?}").into()),
+        };
+        if let Err(e) = res {
+            let reply = Msg::Err { code: e.kind.to_string(), msg: e.msg };
+            proto::write_msg(&mut s, &reply).await.map_err(|e| e.to_string())?;
+        }
+    }
+}
+
+fn cred_method(cred: &Cred) -> &'static str {
+    match cred {
+        Cred::Token { .. } => "jwt",
+        Cred::Code { .. } => "code",
+        Cred::Session { .. } => "session",
+        Cred::Any => "unlimit",
+    }
+}
+
+/// Watchdog for established connections: a peer that goes silent is dropped
+/// instead of pinning a task forever. `0` disables it.
+fn idle_of(st: &State) -> Option<Duration> {
+    (st.cfg.idle_timeout > 0).then(|| Duration::from_secs(st.cfg.idle_timeout))
+}
+
+async fn next_msg(s: &mut TcpStream, idle: Option<Duration>, what: &str) -> Result<Msg, String> {
+    let read = proto::read_msg(s);
+    match idle {
+        None => read.await.map_err(|e| e.to_string()),
+        Some(d) => match tokio::time::timeout(d, read).await {
+            Ok(r) => r.map_err(|e| e.to_string()),
+            Err(_) => Err(format!("{what}: no traffic for {}s", d.as_secs())),
+        },
+    }
+}
+
+async fn authenticate(st: &State, id: &str, pubkey: &str, cred: &Cred, ip: IpAddr) -> Result<(), String> {
+    if st.cfg.unlimit {
+        return Ok(());
+    }
+    match cred {
+        Cred::Any => Err("unlimit mode is disabled on this device".into()),
+        Cred::Token { token } => {
+            // Reload from disk: `dtu device rm` edits trust.json from another process,
+            // and a revoked device must lose access immediately, not on restart.
+            let snapshot = trust_snapshot(st).await;
+            let pinned = match snapshot.get(id) {
+                Some(d) => d.clone(),
+                None if snapshot.get_raw(id).is_some() => {
+                    return Err(format!("authorization for {id} expired, pair again"))
+                }
+                None => return Err("unknown device, pair first".into()),
+            };
+            if pinned.pubkey != pubkey {
+                return Err("pinned public key mismatch".into());
+            }
+            // The token we present is one *this* server issued, so it verifies with our own key.
+            jwt::verify(&st.id.pubkey(), token, &st.id.id, id, identity::now())?;
+            Ok(())
+        }
+        Cred::Session { token } => {
+            jwt::verify(&st.id.pubkey(), token, &st.id.id, id, identity::now())?;
+            // A session hangs off an authenticated device: it must still be trusted,
+            // or it must belong to a code-auth session (code devices are not trusted).
+            if trust_snapshot(st).await.get(id).is_some() {
+                return Ok(());
+            }
+            let from_code = {
+                let mut sessions = st.code_sessions.lock().await;
+                let now = identity::now();
+                sessions.retain(|_, exp| *exp > now);
+                sessions.contains_key(id)
+            };
+            if from_code {
+                Ok(())
+            } else {
+                Err("session belongs to a device that is no longer trusted".into())
+            }
+        }
+        Cred::Code { code, password } => {
+            {
+                let mut fails = st.fails.lock().await;
+                // drop ancient entries so the map cannot grow forever
+                fails.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(120));
+                let e = fails.entry(ip).or_insert((0, std::time::Instant::now()));
+                if e.1.elapsed() > Duration::from_secs(60) {
+                    *e = (0, std::time::Instant::now());
+                }
+                if e.0 >= MAX_CODE_FAILS {
+                    return Err("too many failed attempts, wait a minute".into());
+                }
+            }
+            let ok = {
+                let c = st.code.lock().await;
+                if c.code.is_empty() || (st.cfg.code_one_shot && c.consumed) {
+                    return Err("no active pairing code".into());
+                }
+                let code_ok = identity::ct_eq(&c.code, &code.trim().to_ascii_uppercase());
+                let pass_ok = match (&c.password, password) {
+                    (None, _) => true,
+                    (Some(p), Some(given)) => identity::ct_eq(p, given),
+                    (Some(_), None) => false,
+                };
+                code_ok && pass_ok
+            };
+            if !ok {
+                let mut fails = st.fails.lock().await;
+                let e = fails.entry(ip).or_insert((0, std::time::Instant::now()));
+                e.0 += 1;
+                return Err("wrong pairing code".into());
+            }
+            if st.cfg.code_one_shot {
+                st.code.lock().await.consumed = true;
+            }
+            // Remember the code-auth session so it keeps working without a trust entry.
+            let exp = identity::now() + st.cfg.session_ttl.max(60);
+            st.code_sessions.lock().await.insert(id.to_string(), exp);
+            Ok(())
+        }
+    }
+}
+
+/// Trust store as another process currently sees it on disk.
+async fn trust_snapshot(st: &State) -> Store {
+    let mut guard = st.trust.lock().await;
+    if let Some(fresh) = crate::cfg::read_json::<Store>(&cfg::file("trust.json")) {
+        *guard = fresh;
+    }
+    guard.clone()
+}
+
