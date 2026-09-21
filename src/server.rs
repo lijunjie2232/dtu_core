@@ -585,3 +585,68 @@ async fn put_end(
     proto::write_msg(s, &Msg::Ok).await.map_err(|e| OpError::io(e.to_string()))
 }
 
+async fn get(s: &mut TcpStream, st: &State, path: &str, offset: u64, len: u64) -> Result<(), OpError> {
+    let target = guard::resolve(&st.root, path).map_err(OpError::path)?;
+    let md = tokio::fs::metadata(&target).await.map_err(|e| format!("stat {}: {e}", target.display()))?;
+    if md.is_dir() {
+        return Err(OpError::new("isdir", "path is a directory"));
+    }
+    let size = md.len();
+    let mtime = guard::mtime_of(md.modified().ok());
+    let start = offset.min(size);
+    let end = offset.saturating_add(len).min(size);
+
+    proto::write_msg(s, &Msg::Resume { offset: start, size, mtime }).await.map_err(|e| e.to_string())?;
+    let mut f = tokio::fs::File::open(&target).await.map_err(|e| e.to_string())?;
+    f.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| e.to_string())?;
+    let mut remaining = end - start;
+    let mut buf = vec![0u8; BUF];
+    while remaining > 0 {
+        let take = remaining.min(buf.len() as u64) as usize;
+        let n = f.read(&mut buf[..take]).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        proto::send_data(s, &buf[..n]).await.map_err(|e| e.to_string())?;
+        remaining -= n as u64;
+    }
+    proto::send_data(s, &[]).await.map_err(|e| OpError::io(e.to_string()))
+}
+
+async fn list(s: &mut TcpStream, st: &State, path: &str) -> Result<(), OpError> {
+    let base = guard::resolve(&st.root, path).map_err(OpError::path)?;
+    if !base.exists() {
+        return Err(OpError::new("notfound", format!("no such path: {path}")));
+    }
+    let is_file = base.is_file();
+    let rel = path.replace('\\', "/").trim_matches('/').to_string();
+    let items = tokio::task::spawn_blocking(move || guard::walk(&base))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    let items = items
+        .into_iter()
+        .map(|mut e| {
+            if is_file {
+                e.path = rel.clone();
+            } else if !rel.is_empty() {
+                e.path = format!("{rel}/{}", e.path);
+            }
+            e
+        })
+        .collect::<Vec<_>>();
+    // Chunk: a big tree used to overflow MAX_CTRL and break diff/async entirely.
+    let mut rest = items;
+    loop {
+        let tail = if rest.len() > LIST_CHUNK { rest.split_off(LIST_CHUNK) } else { Vec::new() };
+        let more = !tail.is_empty();
+        proto::write_msg(s, &Msg::Entries { items: rest, more })
+            .await
+            .map_err(|e| e.to_string())?;
+        if !more {
+            return Ok(());
+        }
+        rest = tail;
+    }
+}
+
