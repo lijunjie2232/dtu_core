@@ -441,3 +441,147 @@ async fn trust_snapshot(st: &State) -> Store {
     guard.clone()
 }
 
+async fn put(
+    s: &mut TcpStream,
+    st: &State,
+    path: &str,
+    size: u64,
+    offset: u64,
+    len: u64,
+    truncate: bool,
+) -> Result<(), OpError> {
+    let end = offset.checked_add(len).ok_or_else(|| OpError::new("range", "range overflow"))?;
+    if end > size {
+        return Err(OpError::new("range", format!("range {offset}..{end} outside file size {size}")));
+    }
+    // Bytes land in `<name>.dtu-part`; `put_end` verifies and renames into place, so
+    // a reader of the served tree never sees a half-written file.
+    let target = guard::part_path(&guard::resolve(&st.root, path).map_err(OpError::path)?);
+    if let Some(dir) = target.parent() {
+        tokio::fs::create_dir_all(dir).await.map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    }
+    let mut f = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&target)
+        .await
+        .map_err(|e| OpError::io(format!("open {}: {e}", target.display())))?;
+    // ponytail: no cross-connection lock, so two clients pushing the same path
+    // interleave per range. Add a per-path lock if that ever matters.
+    if truncate {
+        f.set_len(0).await.map_err(|e| e.to_string())?;
+        // a fresh start invalidates whatever we remembered about this path
+        st.ranges.lock().await.remove(path);
+    }
+    let cur = f.metadata().await.map_err(|e| e.to_string())?.len();
+    // Trust the ranges this path recorded, and nothing else: the part file's *length*
+    // is not a prefix. A parallel push opens its ranges at the same time, so a higher
+    // range can have written past this one's start before this range begins — reading
+    // the length as "already sent" would skip these bytes and silently corrupt the file.
+    let start = match st.ranges.lock().await.get(path) {
+        Some(done) if done.iter().any(|(ds, de)| *ds <= offset && end <= *de) => end,
+        _ => offset,
+    };
+
+    proto::write_msg(s, &Msg::Resume { offset: start, size: cur, mtime: 0 }).await.map_err(|e| e.to_string())?;
+
+    f.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| e.to_string())?;
+    let mut remaining = end - start;
+    let mut buf = vec![0u8; BUF];
+    let idle = idle_of(st);
+    loop {
+        let n = match next_msg(s, idle, "put").await? {
+            Msg::Data { len: n } => n,
+            other => return Err(OpError::new("op", format!("expected data frame, got {other:?}"))),
+        };
+        if n == 0 {
+            break;
+        }
+        if n > remaining {
+            // Drain exactly what the frame declared, then refuse: the connection
+            // stays framed instead of re-interpreting the payload as a frame.
+            let mut left = n;
+            while left > 0 {
+                let chunk = left.min(buf.len() as u64) as usize;
+                s.read_exact(&mut buf[..chunk]).await.map_err(|e| e.to_string())?;
+                left -= chunk as u64;
+            }
+            return Err(OpError::new("range", "client sent more bytes than the range allows"));
+        }
+        remaining -= n;
+        let mut left = n;
+        while left > 0 {
+            let chunk = left.min(buf.len() as u64) as usize;
+            s.read_exact(&mut buf[..chunk]).await.map_err(|e| e.to_string())?;
+            f.write_all(&buf[..chunk]).await.map_err(|e| e.to_string())?;
+            left -= chunk as u64;
+        }
+    }
+    if remaining > 0 {
+        return Err(OpError::new("range", format!("range ended {remaining} bytes short")));
+    }
+    f.flush().await.map_err(|e| e.to_string())?;
+    st.ranges
+        .lock()
+        .await
+        .entry(path.to_string())
+        .or_default()
+        .push((start, end));
+    proto::write_msg(s, &Msg::Ok).await.map_err(|e| OpError::io(e.to_string()))
+}
+
+async fn put_end(
+    s: &mut TcpStream,
+    st: &State,
+    path: &str,
+    size: u64,
+    mtime: u64,
+    sha256: Option<String>,
+) -> Result<(), OpError> {
+    let final_path = guard::resolve(&st.root, path).map_err(OpError::path)?;
+    let part = guard::part_path(&final_path);
+    {
+        let f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .await
+            .map_err(|e| OpError::io(format!("open {}: {e}", guard::for_display(&part))))?;
+        let cur = f.metadata().await.map_err(|e| e.to_string())?.len();
+        if cur < size {
+            return Err(OpError::new("incomplete", format!("incomplete upload: have {cur} of {size}")));
+        }
+        f.set_len(size).await.map_err(|e| e.to_string())?;
+        // ponytail: no fsync here. Flushing synchronously costs ~20x on ordinary disks
+        // (measured 47 MB/s vs 1.1 GB/s), and every copy tool trusts the page cache.
+        // Add `.sync_all()` back if a crash within seconds must never lose a byte.
+    }
+
+    if let Some(expected) = sha256 {
+        let probe = part.clone();
+        let got = tokio::task::spawn_blocking(move || guard::sha256_file(&probe))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        if got != expected {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(OpError::new("checksum", format!("got {got}, expected {expected} — partial discarded, retry")));
+        }
+    }
+
+    tokio::fs::rename(&part, &final_path)
+        .await
+        .map_err(|e| OpError::io(format!("move into place {}: {e}", guard::for_display(&final_path))))?;
+    st.ranges.lock().await.remove(path);
+    if mtime > 0 {
+        let landed = final_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let f = std::fs::OpenOptions::new().write(true).open(&landed)?;
+            f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(mtime))
+        })
+        .await;
+    }
+    proto::write_msg(s, &Msg::Ok).await.map_err(|e| OpError::io(e.to_string()))
+}
+
