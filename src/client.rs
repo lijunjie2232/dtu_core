@@ -249,3 +249,54 @@ fn expand_locals(locals: &[String]) -> Result<Vec<(PathBuf, String, bool)>, Stri
     Ok(out)
 }
 
+/// Create a remote directory (and its parents).
+pub async fn mkdir(t: &Target, me: &Identity, remote: &str) -> Result<(), String> {
+    warm(t, me).await?;
+    let mut c = connect(t, me).await?;
+    proto::write_msg(&mut c.s, &Msg::Mkdir { path: remote.into() })
+        .await
+        .map_err(|e| e.to_string())?;
+    expect_ok(&mut c.s, "mkdir").await
+}
+
+fn strip_base(spec: &str, entries: Vec<Entry>) -> Vec<(String, Entry)> {
+    let base = spec.replace('\\', "/").trim_matches('/').to_string();
+    let single_file = entries.len() == 1 && entries[0].path == base;
+    entries
+        .into_iter()
+        .map(|e| {
+            let rel = if single_file {
+                Path::new(&base)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| base.clone())
+            } else {
+                let prefix = if base.is_empty() { String::new() } else { format!("{base}/") };
+                e.path.strip_prefix(&prefix).unwrap_or(&e.path).to_string()
+            };
+            (rel, e)
+        })
+        .collect()
+}
+
+pub async fn list(t: &Target, me: &Identity, path: &str) -> Result<Vec<Entry>, String> {
+    warm(t, me).await?;
+    let mut c = connect(t, me).await?;
+    proto::write_msg(&mut c.s, &Msg::List { path: path.to_string() })
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut all = Vec::new();
+    loop {
+        match proto::read_msg(&mut c.s).await.map_err(|e| e.to_string())? {
+            Msg::Entries { items, more } => {
+                all.extend(items);
+                if !more {
+                    return Ok(all);
+                }
+            }
+            Msg::Err { code, msg } => return Err(format!("list {path}: {code}: {msg}")),
+            other => return Err(format!("list {path}: unexpected {other:?}")),
+        }
+    }
+}
+
