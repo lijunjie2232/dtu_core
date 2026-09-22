@@ -175,3 +175,77 @@ pub async fn warm(t: &Target, me: &Identity) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct Plan {
+    pub parallel: usize,
+    pub resume: bool,
+    /// End-to-end sha256 check. Costs one extra sequential read on each side.
+    pub verify: bool,
+}
+
+/// Split `size` into at most `parallel` ranges, each at least CHUNK_MIN when possible.
+pub fn ranges(size: u64, parallel: usize) -> Vec<(u64, u64)> {
+    if size == 0 {
+        return vec![(0, 0)];
+    }
+    let chunks = size.div_ceil(CHUNK_MIN) as usize;
+    let k = parallel.max(1).min(chunks.max(1));
+    let step = size.div_ceil(k as u64);
+    let mut out = Vec::with_capacity(k);
+    let mut start = 0;
+    while start < size {
+        let end = (start + step).min(size);
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+fn join_rel(base: &str, rel: &str) -> String {
+    let base = base.replace('\\', "/").trim_matches('/').to_string();
+    if base.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+async fn expect_ok(s: &mut TcpStream, what: &str) -> Result<(), String> {
+    match proto::read_msg(s).await.map_err(|e| format!("{what}: {e}"))? {
+        Msg::Ok => Ok(()),
+        Msg::Err { code, msg } => Err(format!("{what}: {code}: {msg}")),
+        other => Err(format!("{what}: unexpected {other:?}")),
+    }
+}
+
+async fn expect_resume(s: &mut TcpStream) -> Result<(u64, u64), String> {
+    match proto::read_msg(s).await.map_err(|e| e.to_string())? {
+        Msg::Resume { offset, size, .. } => Ok((offset, size)),
+        Msg::Err { code, msg } => Err(format!("{code}: {msg}")),
+        other => Err(format!("expected resume, got {other:?}")),
+    }
+}
+
+/// (local path, path relative to the pushed directory, is a directory)
+fn expand_locals(locals: &[String]) -> Result<Vec<(PathBuf, String, bool)>, String> {
+    let mut out = Vec::new();
+    for spec in locals {
+        let p = PathBuf::from(spec);
+        let md = std::fs::metadata(&p).map_err(|e| format!("{spec}: {e}"))?;
+        if md.is_file() {
+            let name = p
+                .file_name()
+                .ok_or_else(|| format!("{spec}: not a file name"))?
+                .to_string_lossy()
+                .into_owned();
+            out.push((p, name, false));
+        } else {
+            let base = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            for e in guard::walk(&p).map_err(|e| format!("{spec}: {e}"))? {
+                out.push((p.join(&e.path), join_rel(&base, &e.path), e.dir));
+            }
+        }
+    }
+    Ok(out)
+}
+
