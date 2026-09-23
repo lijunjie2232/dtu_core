@@ -365,3 +365,264 @@ pub async fn ranges_done(t: &Target, me: &Identity, remote: &str) -> Result<(Vec
     }
 }
 
+pub async fn push(t: &Target, me: Arc<Identity>, locals: &[String], remote_dir: &str, plan: Plan) -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
+    for (local, rel, is_dir) in expand_locals(locals)? {
+        let remote = join_rel(remote_dir, &rel);
+        if is_dir {
+            mkdir(t, &me, &remote).await?;
+        } else {
+            put_one(t, me.clone(), &local, &remote, plan).await?;
+        }
+        done.push(remote);
+    }
+    Ok(done)
+}
+
+pub async fn pull(t: &Target, me: Arc<Identity>, remotes: &[String], local_dir: &str, plan: Plan) -> Result<Vec<String>, String> {
+    let mut done = Vec::new();
+    for spec in remotes {
+        let items = strip_base(spec, list(t, &me, spec).await?);
+        for (rel, e) in items {
+            let local = PathBuf::from(local_dir).join(&rel);
+            get_one(t, me.clone(), &e, &local, plan).await?;
+            done.push(local.display().to_string());
+        }
+    }
+    Ok(done)
+}
+
+async fn put_one(t: &Target, me: Arc<Identity>, local: &Path, remote: &str, plan: Plan) -> Result<(), String> {
+    warm(t, &me).await?;
+    let md = std::fs::metadata(local).map_err(|e| format!("{}: {e}", local.display()))?;
+    let size = md.len();
+    let mtime = guard::mtime(&md);
+
+    // Pre-flight: ask which ranges the peer already holds. A middle hole is now
+    // resumable, and a *longer* part file is still not a prefix of this one.
+    let (mut done, spare) = if plan.resume {
+        let (done, part, conn) = ranges_done(t, &me, remote).await?;
+        if part > size {
+            let begin = Msg::PutBegin { path: remote.into(), size, offset: 0, len: 0, truncate: true };
+            let mut c = conn;
+            proto::write_msg(&mut c.s, &begin).await.map_err(|e| e.to_string())?;
+            expect_resume(&mut c.s).await?;
+            proto::send_data(&mut c.s, &[]).await.map_err(|e| e.to_string())?;
+            expect_ok(&mut c.s, "truncate").await?;
+            (Vec::new(), c)
+        } else {
+            (done, conn)
+        }
+    } else {
+        let mut c = connect(t, &me).await?;
+        let begin = Msg::PutBegin { path: remote.into(), size, offset: 0, len: 0, truncate: true };
+        proto::write_msg(&mut c.s, &begin).await.map_err(|e| e.to_string())?;
+        expect_resume(&mut c.s).await?;
+        proto::send_data(&mut c.s, &[]).await.map_err(|e| e.to_string())?;
+        expect_ok(&mut c.s, "truncate").await?;
+        (Vec::new(), c)
+    };
+    done.sort_unstable();
+
+    let mut tasks = Vec::new();
+    let mut spare = Some(spare);
+    for (start, end) in ranges(size, plan.parallel) {
+        // skip ranges the peer already completed
+        if done.iter().any(|(ds, de)| *ds <= start && end <= *de) {
+            continue;
+        }
+        let (t, me, local, remote) = (t.clone(), me.clone(), local.to_path_buf(), remote.to_string());
+        // the probe connection is already authenticated: use it for the first range
+        let conn = spare.take();
+        tasks.push(tokio::spawn(async move {
+            put_range(&t, &me, &local, &remote, size, (start, end), conn).await
+        }));
+    }
+    // Hash the local file in parallel with the transfer when verification is on: it
+    // only costs wall-clock time when the network is faster than a sequential read.
+    let hashing = plan.verify.then(|| {
+        let src = local.to_path_buf();
+        tokio::task::spawn_blocking(move || guard::sha256_file(&src))
+    });
+    for task in tasks {
+        task.await.map_err(|e| e.to_string())??;
+    }
+    let digest = match hashing {
+        None => None,
+        Some(job) => Some(job.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?),
+    };
+    let mut c = connect(t, &me).await?;
+    let end = Msg::PutEnd { path: remote.into(), size, mtime, sha256: digest };
+    proto::write_msg(&mut c.s, &end).await.map_err(|e| e.to_string())?;
+    expect_ok(&mut c.s, "put end").await
+}
+
+async fn put_range(
+    t: &Target,
+    me: &Identity,
+    local: &Path,
+    remote: &str,
+    size: u64,
+    range: (u64, u64),
+    conn: Option<Conn>,
+) -> Result<(), String> {
+    let (start, end) = range;
+    let mut c = match conn {
+        Some(c) => c,
+        None => connect(t, me).await?,
+    };
+    let begins = Msg::PutBegin { path: remote.into(), size, offset: start, len: end - start, truncate: false };
+    proto::write_msg(&mut c.s, &begins).await.map_err(|e| e.to_string())?;
+    let (offset, _) = expect_resume(&mut c.s).await?;
+
+    let mut f = tokio::fs::File::open(local).await.map_err(|e| format!("{}: {e}", local.display()))?;
+    let mut pos = offset.max(start);
+    if pos < end {
+        f.seek(std::io::SeekFrom::Start(pos)).await.map_err(|e| e.to_string())?;
+    }
+    let mut buf = vec![0u8; BUF];
+    while pos < end {
+        let take = ((end - pos) as usize).min(buf.len());
+        f.read_exact(&mut buf[..take])
+            .await
+            .map_err(|e| format!("read {}: {e}", local.display()))?;
+        proto::send_data(&mut c.s, &buf[..take]).await.map_err(|e| e.to_string())?;
+        pos += take as u64;
+    }
+    proto::send_data(&mut c.s, &[]).await.map_err(|e| e.to_string())?;
+    expect_ok(&mut c.s, "put range").await
+}
+
+async fn get_one(t: &Target, me: Arc<Identity>, e: &Entry, local: &Path, plan: Plan) -> Result<(), String> {
+    warm(t, &me).await?;
+    if e.dir {
+        return tokio::fs::create_dir_all(local)
+            .await
+            .map_err(|err| format!("mkdir {}: {err}", local.display()));
+    }
+    if let Some(dir) = local.parent() {
+        if !dir.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(dir).await.map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+        }
+    }
+    // Same staging rule as the daemon: download into `<name>.dtu-part`, land it only
+    // once it is complete, so a partial pull is resumable and never visible.
+    let part = guard::part_path(local);
+    // A staged file longer than the remote one cannot be a prefix of it; keeping it
+    // would leave old bytes behind after the final truncate.
+    if let Ok(md) = tokio::fs::metadata(&part).await {
+        if md.len() > e.size {
+            let f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&part)
+                .await
+                .map_err(|e| format!("{}: {e}", part.display()))?;
+            drop(f);
+        }
+    }
+    if !plan.resume {
+        let f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&part)
+            .await
+            .map_err(|e| format!("{}: {e}", part.display()))?;
+        drop(f);
+    }
+
+    let mut tasks = Vec::new();
+    for (start, end) in ranges(e.size, plan.parallel) {
+        let (t, me, part, remote) = (t.clone(), me.clone(), part.clone(), e.path.clone());
+        let expected = e.size;
+        tasks.push(tokio::spawn(async move { pull_range(&t, &me, &remote, &part, start, end, expected).await }));
+    }
+    for task in tasks {
+        task.await.map_err(|e| e.to_string())??;
+    }
+
+    let f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .await
+        .map_err(|e| format!("{}: {e}", part.display()))?;
+    f.set_len(e.size).await.map_err(|e| e.to_string())?;
+    drop(f);
+    if e.mtime > 0 {
+        let (part, mtime) = (part.clone(), e.mtime);
+        let _ = tokio::task::spawn_blocking(move || {
+            let f = std::fs::OpenOptions::new().write(true).open(&part)?;
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime))
+        })
+        .await;
+    }
+    tokio::fs::rename(&part, local)
+        .await
+        .map_err(|e| format!("move into place {}: {e}", local.display()))?;
+    Ok(())
+}
+
+async fn pull_range(
+    t: &Target,
+    me: &Identity,
+    remote: &str,
+    local: &Path,
+    start: u64,
+    end: u64,
+    expected: u64,
+) -> Result<(), String> {
+    // Resume from what the local partial already holds, clamped into this range.
+    let have = tokio::fs::metadata(local).await.map(|m| m.len()).unwrap_or(0);
+    let from = have.clamp(start, end);
+    if from >= end {
+        return Ok(());
+    }
+    let mut c = connect(t, me).await?;
+    proto::write_msg(&mut c.s, &Msg::GetBegin { path: remote.into(), offset: from, len: end - from })
+        .await
+        .map_err(|e| e.to_string())?;
+    let (offset, size) = expect_resume(&mut c.s).await?;
+    // The size came from a listing snapshot; if the peer rewrote the file since,
+    // writing what we fetch would leave a torn file. Refuse instead.
+    if size != expected {
+        return Err(format!("{remote} changed size while transferring ({size} != {expected}), re-run the command"));
+    }
+
+    let mut f = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(local)
+        .await
+        .map_err(|e| format!("{}: {e}", local.display()))?;
+    let mut pos = offset.max(start);
+    if pos < end {
+        f.seek(std::io::SeekFrom::Start(pos)).await.map_err(|e| e.to_string())?;
+    }
+    let mut buf = vec![0u8; BUF];
+    loop {
+        let n = match proto::read_msg(&mut c.s).await.map_err(|e| e.to_string())? {
+            Msg::Data { len } => len,
+            Msg::Err { code, msg } => return Err(format!("{code}: {msg}")),
+            other => return Err(format!("expected data, got {other:?}")),
+        };
+        if n == 0 {
+            break;
+        }
+        if n > end.saturating_sub(pos) {
+            return Err("server sent more bytes than requested".into());
+        }
+        let mut left = n;
+        while left > 0 {
+            let take = left.min(buf.len() as u64) as usize;
+            c.s.read_exact(&mut buf[..take]).await.map_err(|e| e.to_string())?;
+            f.write_all(&buf[..take]).await.map_err(|e| e.to_string())?;
+            left -= take as u64;
+        }
+        pos += n;
+    }
+    Ok(())
+}
+
