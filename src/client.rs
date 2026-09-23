@@ -300,3 +300,68 @@ pub async fn list(t: &Target, me: &Identity, path: &str) -> Result<Vec<Entry>, S
     }
 }
 
+/// What a `push` would do, without moving any bytes.
+#[derive(Debug, Clone)]
+pub struct PushRow {
+    pub remote: String,
+    pub local_size: u64,
+    /// Bytes already on the peer, 0 when the file is absent.
+    pub remote_size: u64,
+}
+
+impl PushRow {
+    pub fn up_to_date(&self) -> bool {
+        self.remote_size == self.local_size
+    }
+}
+
+/// Read-only size probe of a peer file (0 when absent).
+pub async fn stat(t: &Target, me: &Identity, remote: &str) -> Result<u64, String> {
+    warm(t, me).await?;
+    let mut c = connect(t, me).await?;
+    proto::write_msg(&mut c.s, &Msg::Stat { path: remote.into() })
+        .await
+        .map_err(|e| e.to_string())?;
+    match proto::read_msg(&mut c.s).await.map_err(|e| e.to_string())? {
+        Msg::Resume { size, .. } => Ok(size),
+        Msg::Err { code, msg } => Err(format!("stat {remote}: {code}: {msg}")),
+        other => Err(format!("stat {remote}: unexpected {other:?}")),
+    }
+}
+
+/// Probe the peer for each file without transferring anything.
+pub async fn plan_push(
+    t: &Target,
+    me: Arc<Identity>,
+    locals: &[String],
+    remote_dir: &str,
+) -> Result<Vec<PushRow>, String> {
+    warm(t, &me).await?;
+    let mut rows = Vec::new();
+    for (local, rel, is_dir) in expand_locals(locals)? {
+        if is_dir {
+            // directories carry no bytes: dry-run only reports files
+            continue;
+        }
+        let remote = join_rel(remote_dir, &rel);
+        let local_size = std::fs::metadata(&local).map_err(|e| format!("{}: {e}", local.display()))?.len();
+        let remote_size = stat(t, &me, &remote).await?;
+        rows.push(PushRow { remote, local_size, remote_size });
+    }
+    Ok(rows)
+}
+
+/// Which byte ranges of an in-progress upload the peer already holds, plus the part
+/// file size. The connection is handed back so it can carry the first range.
+pub async fn ranges_done(t: &Target, me: &Identity, remote: &str) -> Result<(Vec<(u64, u64)>, u64, Conn), String> {
+    let mut c = connect(t, me).await?;
+    proto::write_msg(&mut c.s, &Msg::Map { path: remote.into() })
+        .await
+        .map_err(|e| e.to_string())?;
+    match proto::read_msg(&mut c.s).await.map_err(|e| e.to_string())? {
+        Msg::Ranges { done, size } => Ok((done, size, c)),
+        Msg::Err { code, msg } => Err(format!("map {remote}: {code}: {msg}")),
+        other => Err(format!("map {remote}: unexpected {other:?}")),
+    }
+}
+
