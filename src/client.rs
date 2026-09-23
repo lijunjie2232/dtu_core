@@ -626,3 +626,91 @@ async fn pull_range(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct Row {
+    pub rel: String,
+    /// '+' local only, '-' remote only, '~' differs
+    pub kind: char,
+    pub local: u64,
+    pub remote: u64,
+    pub local_mtime: u64,
+    pub remote_mtime: u64,
+    /// Directories are compared by existence only.
+    pub dir: bool,
+}
+
+pub async fn diff(t: &Target, me: &Identity, local_root: &str, remote: &str) -> Result<Vec<Row>, String> {
+    // A destination that does not exist yet is simply empty: the first `async` into a
+    // fresh directory should push everything instead of failing with "no such path".
+    let remote_entries = match list(t, me, remote).await {
+        Ok(items) => items,
+        Err(e) if e.contains("no such path") => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    let rmap: BTreeMap<String, Entry> = strip_base(remote, remote_entries).into_iter().collect();
+    let lmap: BTreeMap<String, Entry> = guard::walk(&PathBuf::from(local_root))
+        .map_err(|e| format!("{local_root}: {e}"))?
+        .into_iter()
+        .map(|e| (e.path.clone(), e))
+        .collect();
+
+    let mut rows = Vec::new();
+    for (rel, r) in &rmap {
+        match lmap.get(rel) {
+            None => rows.push(Row {
+                rel: rel.clone(),
+                kind: '-',
+                local: 0,
+                remote: r.size,
+                local_mtime: 0,
+                remote_mtime: r.mtime,
+                dir: r.dir,
+            }),
+            Some(l) => {
+                // a directory is either there on both sides or it is a one-sided row
+                let differs = if l.dir || r.dir {
+                    l.dir != r.dir
+                } else {
+                    l.size != r.size || l.mtime.abs_diff(r.mtime) > 1
+                };
+                if differs {
+                    rows.push(Row {
+                        rel: rel.clone(),
+                        kind: '~',
+                        local: l.size,
+                        remote: r.size,
+                        local_mtime: l.mtime,
+                        remote_mtime: r.mtime,
+                        dir: l.dir,
+                    });
+                }
+            }
+        }
+    }
+    for (rel, l) in &lmap {
+        if !rmap.contains_key(rel) {
+            rows.push(Row {
+                rel: rel.clone(),
+                kind: '+',
+                local: l.size,
+                remote: 0,
+                local_mtime: l.mtime,
+                remote_mtime: 0,
+                dir: l.dir,
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(rows)
+}
+
+/// Remove one file on the peer.
+pub async fn del(t: &Target, me: &Identity, path: &str) -> Result<(), String> {
+    warm(t, me).await?;
+    let mut c = connect(t, me).await?;
+    proto::write_msg(&mut c.s, &Msg::Del { path: path.to_string() })
+        .await
+        .map_err(|e| e.to_string())?;
+    expect_ok(&mut c.s, "delete").await
+}
+
