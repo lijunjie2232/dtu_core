@@ -841,3 +841,86 @@ pub async fn sync(
     Ok(log)
 }
 
+/// Send an invitation and wait for the peer's decision, then store mutual trust.
+/// `listen_port` is our own listening port, sent so the peer can keep a dialable
+/// address for us instead of the ephemeral port this connection uses.
+pub async fn invite_send(
+    addr: &str,
+    expires_at: u64,
+    note: Option<String>,
+    me: &Identity,
+    trust: &mut Store,
+    listen_port: u16,
+    on_pending: impl FnOnce(&str, &str),
+) -> Result<String, String> {
+    let mut s = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| format!("connect {addr}: timeout"))?
+        .map_err(|e| format!("connect {addr}: {e}"))?;
+    let inv = Msg::Invite { proto: proto::PROTO, from: me.id.clone(), pubkey: me.pubkey(), expires_at, note, port: listen_port };
+    proto::write_msg(&mut s, &inv).await.map_err(|e| e.to_string())?;
+
+    let (peer, peer_pub) = match proto::read_msg(&mut s).await.map_err(|e| e.to_string())? {
+        Msg::InvitePending { proto: peer_proto, id, peer, pubkey } => {
+            if peer_proto != proto::PROTO {
+                return Err(format!(
+                    "protocol mismatch: peer speaks v{peer_proto}, this build speaks v{} — upgrade the older side",
+                    proto::PROTO
+                ));
+            }
+            on_pending(&id, &peer);
+            (peer, pubkey)
+        }
+        Msg::Err { code, msg } => return Err(format!("{code}: {msg}")),
+        other => return Err(format!("unexpected reply: {other:?}")),
+    };
+
+    match proto::read_msg(&mut s).await.map_err(|e| e.to_string())? {
+        Msg::Accept { token } => {
+            let claims = jwt::verify(&peer_pub, &token, &peer, &me.id, identity::now())?;
+            let mine = jwt::sign(me, &peer, expires_at.max(claims.exp));
+            proto::write_msg(&mut s, &Msg::InviteDone { token: mine }).await.map_err(|e| e.to_string())?;
+            expect_ok(&mut s, "invite").await?;
+            trust.insert(&peer, &peer_pub, &token, claims.exp, Some(addr.to_string()));
+            trust.save()?;
+            Ok(peer)
+        }
+        Msg::Deny { reason } => Err(format!("denied: {}", reason.unwrap_or_default())),
+        Msg::Err { code, msg } => Err(format!("{code}: {msg}")),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn range_splitting() {
+        assert_eq!(ranges(0, 4), vec![(0, 0)]);
+        assert_eq!(ranges(100, 4), vec![(0, 100)]);
+        let r = ranges(100 * CHUNK_MIN, 4);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0].0, 0);
+        assert_eq!(r[3].1, 100 * CHUNK_MIN);
+        assert!(r.windows(2).all(|w| w[0].1 == w[1].0), "ranges must tile: {r:?}");
+        // 12 chunks worth of data over 4 streams -> 4 equal ranges
+        let r = ranges(12 * CHUNK_MIN, 4);
+        assert_eq!(r.len(), 4);
+        assert!(r.iter().all(|(s, e)| e - s == 3 * CHUNK_MIN));
+    }
+
+    #[test]
+    fn addr_normalization() {
+        assert_eq!(normalize_addr("host", 47000), "host:47000");
+        assert_eq!(normalize_addr("host:1234", 47000), "host:1234");
+        assert_eq!(normalize_addr("http://host:1234/", 47000), "host:1234");
+        assert_eq!(normalize_addr("1.2.3.4", 47000), "1.2.3.4:47000");
+        assert_eq!(normalize_addr("::1", 47000), "[::1]:47000");
+        assert_eq!(normalize_addr("[::1]:99", 47000), "[::1]:99");
+        assert_eq!(normalize_addr("[fe80::1%12]", 47000), "[fe80::1%12]:47000");
+    }
+}
+
+
+
