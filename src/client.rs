@@ -714,3 +714,130 @@ pub async fn del(t: &Target, me: &Identity, path: &str) -> Result<(), String> {
     expect_ok(&mut c.s, "delete").await
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Prefer {
+    Newer,
+    Local,
+    Remote,
+}
+
+impl Prefer {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "newer" | "mtime" => Ok(Prefer::Newer),
+            "local" => Ok(Prefer::Local),
+            "remote" => Ok(Prefer::Remote),
+            other => Err(format!("unknown prefer mode {other:?} (newer|local|remote)")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DeleteSide {
+    None,
+    Local,
+    Remote,
+}
+
+impl DeleteSide {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" => Ok(DeleteSide::None),
+            "local" => Ok(DeleteSide::Local),
+            "remote" => Ok(DeleteSide::Remote),
+            other => Err(format!("unknown delete side {other:?} (none|local|remote)")),
+        }
+    }
+}
+
+/// How `sync` resolves a difference and what it does with one-sided files.
+#[derive(Clone, Copy, Debug)]
+pub struct SyncOpts {
+    pub prefer: Prefer,
+    pub dry_run: bool,
+    pub delete: DeleteSide,
+}
+
+/// One-way-per-file reconciliation of local and remote trees.
+pub async fn sync(
+    t: &Target,
+    me: Arc<Identity>,
+    local_root: &str,
+    remote: &str,
+    opts: SyncOpts,
+    plan: Plan,
+) -> Result<Vec<String>, String> {
+    let (prefer, dry, delete) = (opts.prefer, opts.dry_run, opts.delete);
+    let mut log = Vec::new();
+    let rows = diff(t, &me, local_root, remote).await?;
+    for row in &rows {
+        let pull_side = match row.kind {
+            '+' => false,
+            '-' => true,
+            _ => match prefer {
+                Prefer::Local => false,
+                Prefer::Remote => true,
+                Prefer::Newer => row.remote_mtime > row.local_mtime,
+            },
+        };
+        let line = format!(
+            "{}\t{}\tlocal={} remote={}",
+            if pull_side { "pull" } else { "push" },
+            row.rel,
+            row.local,
+            row.remote
+        );
+        if dry {
+            log.push(format!("{line}  (dry run)"));
+            continue;
+        }
+        let local = PathBuf::from(local_root).join(&row.rel);
+        if row.dir {
+            if pull_side {
+                tokio::fs::create_dir_all(&local)
+                    .await
+                    .map_err(|e| format!("mkdir {}: {e}", local.display()))?;
+            } else {
+                mkdir(t, &me, &join_rel(remote, &row.rel)).await?;
+            }
+            log.push(format!("{}\tdir\t{}", if pull_side { "pull" } else { "push" }, row.rel));
+            continue;
+        }
+        if pull_side {
+            let entry = Entry {
+                path: join_rel(remote, &row.rel),
+                size: row.remote,
+                mtime: row.remote_mtime,
+                dir: false,
+            };
+            get_one(t, me.clone(), &entry, &local, plan).await?;
+        } else {
+            put_one(t, me.clone(), &local, &join_rel(remote, &row.rel), plan).await?;
+        }
+        log.push(line);
+    }
+
+    // Deletions run after the transfers, so a half-finished sync never removes the
+    // only copy of something.
+    if delete == DeleteSide::None || dry {
+        return Ok(log);
+    }
+    for row in &rows {
+        // only files are removed; directory rows are left to the operator
+        if row.dir {
+            continue;
+        }
+        let doomed_local = delete == DeleteSide::Local && row.kind == '+';
+        let doomed_remote = delete == DeleteSide::Remote && row.kind == '-';
+        if doomed_local {
+            let local = PathBuf::from(local_root).join(&row.rel);
+            tokio::fs::remove_file(&local).await.map_err(|e| format!("delete {}: {e}", local.display()))?;
+            log.push(format!("del(remote side wins)\t{}", row.rel));
+        } else if doomed_remote {
+            del(t, &me, &join_rel(remote, &row.rel)).await?;
+            log.push(format!("del(remote)\t{}", row.rel));
+        }
+    }
+    Ok(log)
+}
+
