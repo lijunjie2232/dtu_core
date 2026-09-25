@@ -311,3 +311,87 @@ async fn job_view(st: &Arc<State>, path: &str) -> (u16, String) {
     }
 }
 
+async fn respond(sock: &mut TcpStream, status: u16, body: &str) -> Result<(), String> {
+    let head = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
+         Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
+         Connection: close\r\n\r\n",
+        match status {
+            200 => "OK",
+            202 => "Accepted",
+            204 => "No Content",
+            400 => "Bad Request",
+            403 => "Forbidden",
+            500 => "Internal Server Error",
+            _ => "Not Found",
+        },
+        body.len()
+    );
+    sock.write_all(head.as_bytes()).await.map_err(|e| e.to_string())?;
+    sock.write_all(body.as_bytes()).await.map_err(|e| e.to_string())?;
+    sock.flush().await.map_err(|e| e.to_string())
+}
+
+fn param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| decode(v))
+    })
+}
+
+/// `%XX` and `+` only: a filename with a space has to survive the query string.
+fn decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
+                }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_params_survive_encoding() {
+        let q = "op=push&paths=a%20b.txt,dir/c&to=.";
+        assert_eq!(param(q, "paths").as_deref(), Some("a b.txt,dir/c"));
+        assert_eq!(param(q, "op").as_deref(), Some("push"));
+        assert_eq!(param(q, "nope"), None);
+        // a stray percent must not panic
+        assert_eq!(decode("%zz%"), "%zz%");
+    }
+}
+
