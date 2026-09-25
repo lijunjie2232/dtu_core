@@ -115,3 +115,85 @@ async fn route(st: &Arc<State>, method: &str, path: &str, query: &str) -> (u16, 
     }
 }
 
+async fn ctrl_json(st: &Arc<State>, req: Ctrl) -> (u16, String) {
+    match crate::server::control_handle(st, req).await {
+        Ctrl::Err { msg } => (400, json!({ "error": msg }).to_string()),
+        other => (200, untagged(&other)),
+    }
+}
+
+/// The control replies carry a `t` discriminator for the binary protocol; JSON
+/// clients get the payload without it.
+fn untagged(reply: &Ctrl) -> String {
+    match serde_json::to_value(reply) {
+        Ok(Value::Object(mut map)) => {
+            map.remove("t");
+            Value::Object(map).to_string()
+        }
+        Ok(other) => other.to_string(),
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
+async fn devices(st: &State) -> Vec<Value> {
+    let store = st.trust.lock().await.clone();
+    store
+        .devices
+        .iter()
+        .map(|(id, d)| {
+            json!({
+                "id": id,
+                "alias": d.alias,
+                "addr": d.addr,
+                "expires_at": d.expires_at,
+                "expired": store.get(id).is_none(),
+                "pubkey": d.pubkey.chars().take(12).collect::<String>(),
+            })
+        })
+        .collect()
+}
+
+async fn device_action(st: &Arc<State>, method: &str, path: &str, query: &str) -> (u16, String) {
+    let rest = path.trim_start_matches("/api/devices/");
+    let (name, action) = match rest.split_once('/') {
+        Some((n, a)) => (n, Some(a)),
+        None => (rest, None),
+    };
+    let mut store = st.trust.lock().await;
+    let id = store.resolve(name).map(|(id, _)| id.to_string()).unwrap_or_else(|| name.to_string());
+    match (method, action) {
+        ("DELETE", None) => {
+            if !store.remove(&id) {
+                return (404, json!({ "error": format!("no such device: {id}") }).to_string());
+            }
+            let saved = store.save().map_err(|e| json!({ "error": e }).to_string());
+            saved.map_or_else(|e| (500, e), |_| (200, json!({ "removed": id }).to_string()))
+        }
+        ("POST", Some("alias")) => {
+            let alias = param(query, "name").unwrap_or_default();
+            match store.set_alias(&id, Some(&alias)).and_then(|_| store.save()) {
+                Ok(()) => (200, json!({ "id": id, "alias": alias }).to_string()),
+                Err(e) => (400, json!({ "error": e }).to_string()),
+            }
+        }
+        _ => (404, "{\"error\":\"no such action\"}".to_string()),
+    }
+}
+
+async fn invite_action(st: &Arc<State>, path: &str, query: &str) -> (u16, String) {
+    let Some((id, action)) = path.trim_start_matches("/api/invites/").split_once('/') else {
+        return (404, "{\"error\":\"no such endpoint\"}".to_string());
+    };
+    match action {
+        "accept" => {
+            let exp = param(query, "expires").unwrap_or_else(|| "30d".into());
+            match crate::cfg::parse_expiry(&exp) {
+                Ok(expires_at) => ctrl_json(st, Ctrl::InviteAccept { id: id.to_string(), expires_at }).await,
+                Err(e) => (400, json!({ "error": format!("expires: {e}") }).to_string()),
+            }
+        }
+        "deny" => ctrl_json(st, Ctrl::InviteDeny { id: id.to_string() }).await,
+        _ => (404, "{\"error\":\"no such action\"}".to_string()),
+    }
+}
+
