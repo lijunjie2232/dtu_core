@@ -197,3 +197,117 @@ async fn invite_action(st: &Arc<State>, path: &str, query: &str) -> (u16, String
     }
 }
 
+async fn put_config(query: &str) -> (u16, String) {
+    let (Some(key), Some(value)) = (param(query, "key"), param(query, "value")) else {
+        return (400, "{\"error\":\"key and value are required\"}".to_string());
+    };
+    let mut cfg = crate::cfg::Config::load();
+    let out = cfg.set(&key, &value).and_then(|_| cfg.save().map_err(|e| format!("save config: {e}")));
+    match out {
+        Ok(()) => (200, json!({ "ok": true, "note": "takes effect on the next daemon start" }).to_string()),
+        Err(e) => (400, json!({ "error": e }).to_string()),
+    }
+}
+
+/// `op=push|pull|diff|sync`. Runs in the background so a big transfer cannot
+/// pin an HTTP request; poll `GET /api/transfer/<id>` for the log.
+async fn start_job(st: &Arc<State>, query: &str) -> (u16, String) {
+    let op = param(query, "op").unwrap_or_default();
+    if !matches!(op.as_str(), "push" | "pull" | "diff" | "sync") {
+        return (400, "{\"error\":\"op must be push, pull, diff or sync\"}".to_string());
+    }
+    let peer = param(query, "peer").unwrap_or_default();
+    let trust = st.trust.lock().await.clone();
+    let target = match Target::resolve(
+        &st.cfg,
+        &trust,
+        &peer,
+        param(query, "code").as_deref(),
+        param(query, "password").as_deref(),
+    ) {
+        Ok(t) => t,
+        Err(e) => return (400, json!({ "error": e }).to_string()),
+    };
+    // ponytail: paths come comma-separated in the query string; a filename with a
+    // comma needs the JSON body this API does not read yet.
+    let paths: Vec<String> = param(query, "paths")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.trim().to_string())
+        .collect();
+    let to = param(query, "to").unwrap_or_else(|| ".".into());
+    let prefer = match param(query, "prefer") {
+        Some(p) => match client::Prefer::parse(&p) {
+            Ok(p) => p,
+            Err(e) => return (400, json!({ "error": e }).to_string()),
+        },
+        None => client::Prefer::Newer,
+    };
+    let delete = match param(query, "delete") {
+        Some(d) => match client::DeleteSide::parse(&d) {
+            Ok(d) => d,
+            Err(e) => return (400, json!({ "error": e }).to_string()),
+        },
+        None => client::DeleteSide::None,
+    };
+    if op != "diff" && op != "sync" && paths.is_empty() {
+        return (400, "{\"error\":\"paths is required\"}".to_string());
+    }
+    let plan = Plan {
+        parallel: st.cfg.parallel.max(1),
+        resume: param(query, "no_resume").is_none(),
+        verify: param(query, "verify").is_some(),
+    };
+    let opts = client::SyncOpts { prefer, dry_run: param(query, "dry_run").is_some(), delete };
+
+    let local = param(query, "local").unwrap_or_else(|| ".".into());
+    let remote = param(query, "remote").unwrap_or_default();
+
+    let id = crate::identity::random_id();
+    {
+        let mut jobs = st.jobs.lock().await;
+        jobs.retain(|_, j| j.state == "running");
+        if jobs.len() >= MAX_JOBS {
+            jobs.clear();
+        }
+        jobs.insert(id.clone(), Job { kind: op.clone(), state: "running".into(), lines: Vec::new(), error: None });
+    }
+
+    let me = Arc::new(st.id.clone());
+    let st = st.clone();
+    let jid = id.clone();
+    tokio::spawn(async move {
+        let done: Result<Vec<String>, String> = match op.as_str() {
+            "push" => client::push(&target, me, &paths, &to, plan).await.map(|v| v.into_iter().map(|p| format!("pushed {p}")).collect()),
+            "pull" => client::pull(&target, me, &paths, &to, plan).await.map(|v| v.into_iter().map(|p| format!("pulled {p}")).collect()),
+            "diff" => client::diff(&target, &me, &local, &remote)
+                .await
+                .map(|rows| rows.iter().map(|r| format!("{} {:<8} local={} remote={}", r.kind, r.rel, r.local, r.remote)).collect()),
+            _ => client::sync(&target, me, &local, &remote, opts, plan).await,
+        };
+        let mut jobs = st.jobs.lock().await;
+        if let Some(job) = jobs.get_mut(&jid) {
+            match done {
+                Ok(lines) => {
+                    job.lines = lines;
+                    job.state = "done".into();
+                }
+                Err(e) => {
+                    job.state = "error".into();
+                    job.error = Some(e);
+                }
+            }
+        }
+    });
+    (202, json!({ "id": id }).to_string())
+}
+
+async fn job_view(st: &Arc<State>, path: &str) -> (u16, String) {
+    let id = path.trim_start_matches("/api/transfer/");
+    match st.jobs.lock().await.get(id) {
+        Some(job) => (200, serde_json::to_string(job).unwrap_or_default()),
+        None => (404, json!({ "error": format!("no such job: {id}") }).to_string()),
+    }
+}
+
