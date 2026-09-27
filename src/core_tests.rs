@@ -217,3 +217,198 @@ async fn expect_err_coded(s: &mut TcpStream) -> (String, String) {
 
 // ---------------------------------------------------------------- framing
 
+#[tokio::test]
+async fn framing_rejects_bad_frames() {
+    use std::io::ErrorKind;
+
+    // zero-length frame: JSON parse error, never a hang
+    let (mut a, mut b) = tokio::io::duplex(64);
+    a.write_all(&0u32.to_le_bytes()).await.unwrap();
+    assert_eq!(proto::read_msg(&mut b).await.unwrap_err().kind(), ErrorKind::InvalidData);
+
+    // header promises more bytes than arrive
+    let (mut a, mut b) = tokio::io::duplex(64);
+    a.write_all(&50u32.to_le_bytes()).await.unwrap();
+    a.write_all(b"{\"t\":\"Ok\"}").await.unwrap();
+    drop(a);
+    assert_eq!(proto::read_msg(&mut b).await.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+
+    // outgoing chunk above the cap is refused before touching the socket
+    let (mut a, _b) = tokio::io::duplex(16);
+    let big = vec![0u8; (proto::MAX_DATA + 1) as usize];
+    assert_eq!(proto::send_data(&mut a, &big).await.unwrap_err().kind(), ErrorKind::InvalidInput);
+
+    // a frame right at the cap still round-trips
+    let (mut a, mut b) = tokio::io::duplex(proto::MAX_DATA as usize + 1024);
+    let payload = "x".repeat(proto::MAX_CTRL - 32);
+    let writing = tokio::spawn(async move {
+        proto::write_msg(&mut a, &Msg::List { path: payload }).await
+    });
+    match proto::read_msg(&mut b).await.unwrap() {
+        Msg::List { path } => assert_eq!(path.len(), proto::MAX_CTRL - 32),
+        other => panic!("unexpected {other:?}"),
+    }
+    writing.await.unwrap().unwrap();
+}
+
+// ------------------------------------------------------------------- auth
+
+#[tokio::test]
+async fn auth_code_password_and_rate_limit() {
+    let _g = env_lock();
+    let home = home("code");
+    let d = daemon(&home, &home.join("root"), "GOODCODE", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    d.st.code.lock().await.password = Some("pw".into());
+
+    let no_pw = raw_denied(&d.addr, Cred::Code { code: "GOODCODE".into(), password: None }, &me).await;
+    assert!(no_pw.contains("wrong pairing code"), "{no_pw}");
+    let bad_pw = raw_denied(&d.addr, Cred::Code { code: "GOODCODE".into(), password: Some("nope".into()) }, &me).await;
+    assert!(bad_pw.contains("wrong pairing code"), "{bad_pw}");
+
+    // correct code + password, lower case accepted
+    let s = raw(&d.addr, Cred::Code { code: "goodcode".into(), password: Some("pw".into()) }, &me).await;
+    drop(s);
+
+    // one-shot: the code is gone even with the right password
+    let replay = raw_denied(&d.addr, Cred::Code { code: "GOODCODE".into(), password: Some("pw".into()) }, &me).await;
+    assert!(replay.contains("no active pairing code"), "{replay}");
+
+    // per-IP throttle: five misses, then even the right code is refused
+    {
+        let mut c = d.st.code.lock().await;
+        c.code = "RATE".into();
+        c.consumed = false;
+        c.password = None;
+    }
+    d.st.fails.lock().await.clear();
+    for i in 0..5 {
+        let r = raw_denied(&d.addr, Cred::Code { code: "WRONG".into(), password: None }, &me).await;
+        assert!(r.contains("wrong pairing code"), "attempt {i}: {r}");
+    }
+    let locked = raw_denied(&d.addr, Cred::Code { code: "RATE".into(), password: None }, &me).await;
+    assert!(locked.contains("too many failed attempts"), "{locked}");
+
+    // every refusal landed in the audit log with its method
+    let log = std::fs::read_to_string(home.join("auth.log")).unwrap();
+    assert!(log.contains("\"result\":\"deny\""), "{log}");
+    assert!(log.contains("\"method\":\"code\""), "{log}");
+}
+
+#[tokio::test]
+async fn auth_tokens_are_bound_to_issuer_and_audience() {
+    let _g = env_lock();
+    let home = home("token");
+    let d = daemon(&home, &home.join("root"), "unused", |_| {}).await;
+    let a = Identity::load_or_create_at(&home.join("a.json")).unwrap();
+    let c = Identity::load_or_create_at(&home.join("c.json")).unwrap();
+    let now = identity::now();
+
+    // d trusts a, using a token d itself issued for a
+    let good = jwt::sign(&d.st.id, &a.id, now + 3600);
+    {
+        let mut t = d.st.trust.lock().await;
+        t.insert(&a.id, &a.pubkey(), &good, now + 3600, None);
+        t.insert(&c.id, &c.pubkey(), &jwt::sign(&d.st.id, &c.id, now + 3600), now + 3600, None);
+    }
+    drop(raw(&d.addr, Cred::Token { token: good.clone() }, &a).await);
+
+    // a's token presented under c's identity: trust exists, but the audience is wrong
+    let cross = raw_denied(&d.addr, Cred::Token { token: good.clone() }, &c).await;
+    assert!(cross.contains("not for this device"), "{cross}");
+
+    // claim someone else's pinned key
+    let mut s = TcpStream::connect(&d.addr).await.unwrap();
+    let hello = Msg::Hello { proto: proto::PROTO, id: a.id.clone(), pubkey: c.pubkey(), cred: Cred::Token { token: good.clone() }, nonce: 0 };
+    proto::write_msg(&mut s, &hello).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::AuthFail { reason } => assert!(reason.contains("pinned public key"), "{reason}"),
+        other => panic!("expected rejection, got {other:?}"),
+    }
+
+    // token signed by a third party: signature check fails
+    let foreign = jwt::sign(&c, &a.id, now + 3600);
+    let bad_sig = raw_denied(&d.addr, Cred::Token { token: foreign }, &a).await;
+    assert!(bad_sig.contains("bad signature"), "{bad_sig}");
+
+    // expired token
+    let stale = jwt::sign(&d.st.id, &a.id, now - 5);
+    let expired = raw_denied(&d.addr, Cred::Token { token: stale }, &a).await;
+    assert!(expired.contains("expired"), "{expired}");
+
+    // unknown device gets no detail about the token
+    let stranger = Identity::load_or_create_at(&home.join("stranger.json")).unwrap();
+    let unknown = raw_denied(&d.addr, Cred::Token { token: good.clone() }, &stranger).await;
+    assert!(unknown.contains("unknown device"), "{unknown}");
+
+    // a session token is not usable by another identity
+    let session = jwt::sign(&d.st.id, &a.id, now + 600);
+    let stolen = raw_denied(&d.addr, Cred::Session { token: session }, &stranger).await;
+    assert!(stolen.contains("not for this device"), "{stolen}");
+}
+
+#[tokio::test]
+async fn auth_rejects_expired_trust_records() {
+    let _g = env_lock();
+    let home = home("expired");
+    let d = daemon(&home, &home.join("root"), "unused", |_| {}).await;
+    let a = Identity::load_or_create_at(&home.join("a.json")).unwrap();
+    let now = identity::now();
+
+    let token = jwt::sign(&d.st.id, &a.id, now + 3600);
+    {
+        let mut t = d.st.trust.lock().await;
+        t.insert(&a.id, &a.pubkey(), &token.clone(), now - 1, None);
+    }
+    let reason = raw_denied(&d.addr, Cred::Token { token }, &a).await;
+    assert!(reason.contains("expired"), "{reason}");
+    assert!(d.st.trust.lock().await.get(&a.id).is_none(), "expired device must not be usable");
+}
+
+#[tokio::test]
+async fn unlimit_mode_accepts_anything_and_is_opt_in() {
+    let _g = env_lock();
+    let home = home("unlimit");
+    let open = daemon(&home, &home.join("open"), "unused", |c| c.unlimit = true).await;
+    let closed = daemon(&home, &home.join("closed"), "unused", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // no credential at all, wrong code, all accepted while unlimit is on
+    drop(raw(&open.addr, Cred::Any, &me).await);
+    drop(raw(&open.addr, Cred::Code { code: "NONSENSE".into(), password: None }, &me).await);
+    assert!(open.st.trust.lock().await.devices.is_empty(), "unlimit must not persist trust");
+
+    // and nothing is accepted when it is off
+    let r = raw_denied(&closed.addr, Cred::Any, &me).await;
+    assert!(r.contains("unlimit mode is disabled"), "{r}");
+
+    // unlimit invites auto-accept
+    let mut trust = Store::default();
+    let peer = client::invite_send(&open.addr, identity::now() + 600, None, &me, &mut trust, 47000, |_, _| {})
+        .await
+        .unwrap();
+    assert_eq!(peer, open.st.id.id);
+    assert!(open.st.trust.lock().await.devices.is_empty(), "store disabled by default");
+    drop(raw(&open.addr, Cred::Token { token: trust.get(&peer).unwrap().token.clone() }, &me).await);
+
+    // with unlimit_store_trust the peer records the device
+    let keeping = daemon(&home, &home.join("keeping"), "unused", |c| {
+        c.unlimit = true;
+        c.unlimit_store_trust = true;
+    })
+    .await;
+    let mut trust2 = Store::default();
+    let _p2 = client::invite_send(&keeping.addr, identity::now() + 600, None, &me, &mut trust2, 47000, |_, _| {})
+        .await
+        .unwrap();
+    let recorded = keeping.st.trust.lock().await.get_raw(&me.id).cloned().expect("peer should have recorded us");
+    assert_eq!(
+        recorded.addr.as_deref(),
+        Some("127.0.0.1:47000"),
+        "accept must keep the advertised listen port, not the invite's ephemeral one"
+    );
+}
+
+// ------------------------------------------------------------- path guard
+
