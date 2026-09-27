@@ -412,3 +412,232 @@ async fn unlimit_mode_accepts_anything_and_is_opt_in() {
 
 // ------------------------------------------------------------- path guard
 
+#[tokio::test]
+async fn path_guard_blocks_every_escape_it_can() {
+    let _g = env_lock();
+    let home = home("paths");
+    let root = home.join("root");
+    std::fs::create_dir_all(root.join("ok")).unwrap();
+    let d = daemon(&home, &root, "PATHS", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "PATHS".into(), password: None }, &me).await;
+
+    for bad in [
+        "../secret",
+        "a/../../secret",
+        "..",
+        "/etc/passwd",
+        "C:\\Windows\\win.ini",
+        "\\\\?\\C:\\Windows",
+        "\\\\.\\pipe\\x",
+        "//server/share/x",
+        "..\\..\\secret",
+    ] {
+        proto::write_msg(&mut s, &Msg::List { path: bad.into() }).await.unwrap();
+        let msg = expect_err(&mut s).await;
+        assert!(msg.contains("path"), "{bad:?} gave {msg}");
+    }
+
+    // normal relative paths still work through the same connection
+    proto::write_msg(&mut s, &Msg::List { path: "ok".into() }).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Entries { items, .. } => assert!(items.is_empty()),
+        other => panic!("expected entries, got {other:?}"),
+    }
+
+    // write attempts through traversal are refused too
+    let begin = Msg::PutBegin { path: "../outside.bin".into(), size: 1, offset: 0, len: 1, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("path"));
+    assert!(!home.join("outside.bin").exists(), "traversal must not write outside the root");
+}
+
+#[tokio::test]
+async fn path_guard_rejects_symlink_escape_when_available() {
+    let _g = env_lock();
+    let home = home("link");
+    let root = home.join("root");
+    let outside = home.join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+    // creating links needs privileges on Windows; skip when unavailable
+    let linked = symlink_dir(&outside, &root.join("link")).is_ok();
+    if !linked {
+        eprintln!("skipping: cannot create symlinks in this environment");
+        return;
+    }
+
+    assert!(guard::resolve(&root, "link/secret.txt").is_err(), "symlink escape must be refused");
+    // walk never follows links out of the tree
+    let entries = guard::walk(&root).unwrap();
+    assert!(entries.iter().all(|e| !e.path.contains("secret")), "{entries:?}");
+}
+
+// -------------------------------------------------------- transfer edges
+
+#[tokio::test]
+async fn transfer_edge_cases() {
+    let _g = env_lock();
+    let home = home("edge");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "EDGE", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "EDGE");
+    let plan = Plan { parallel: 4, resume: true , verify: false};
+
+    // empty file over stale remote content must end up empty
+    std::fs::create_dir_all(root.join("e")).unwrap();
+    std::fs::write(root.join("e/empty.bin"), b"stale bytes here").unwrap();
+    std::fs::write(work.join("empty.bin"), b"").unwrap();
+    client::push(&t, me.clone(), &[work.join("empty.bin").display().to_string()], "e", plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("e/empty.bin")).unwrap().len(), 0);
+
+    // one byte, and a non-ASCII name
+    std::fs::write(work.join("one.bin"), b"x").unwrap();
+    std::fs::write(work.join("报告 α.txt"), b"unicode payload").unwrap();
+    let locals = vec![
+        work.join("one.bin").display().to_string(),
+        work.join("报告 α.txt").display().to_string(),
+    ];
+    client::push(&t, me.clone(), &locals, "e", plan).await.unwrap();
+    assert_eq!(std::fs::read(root.join("e/one.bin")).unwrap(), b"x");
+    assert_eq!(std::fs::read(root.join("e/报告 α.txt")).unwrap(), b"unicode payload");
+
+    // a tree: 5 dirs x 6 files, nested three levels deep
+    let tree = work.join("tree");
+    let mut expected = Vec::new();
+    for i in 0..5 {
+        for j in 0..6 {
+            let dir = tree.join(format!("d{i}/n{j}/leaf"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let body = format!("file {i}-{j}");
+            std::fs::write(dir.join("f.txt"), &body).unwrap();
+            expected.push((format!("d{i}/n{j}/leaf/f.txt"), body));
+        }
+    }
+    client::push(&t, me.clone(), &[tree.display().to_string()], "deep", plan).await.unwrap();
+    assert_eq!(
+        guard::walk(&root.join("deep/tree")).unwrap().iter().filter(|e| !e.dir).count(),
+        expected.len()
+    );
+    for (rel, body) in &expected {
+        let got = std::fs::read_to_string(root.join("deep/tree").join(rel)).unwrap();
+        assert_eq!(&got, body, "{rel}");
+    }
+
+    // pulling into a directory that does not exist yet
+    let out = home.join("out/nested");
+    client::pull(&t, me.clone(), &["e/报告 α.txt".to_string()], &out.display().to_string(), plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(out.join("报告 α.txt")).unwrap(), b"unicode payload");
+}
+
+#[tokio::test]
+async fn resume_survives_a_real_disconnect() {
+    let _g = env_lock();
+    let home = home("resume");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "RESUME", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let me_raw = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    let payload: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
+    let local = work.join("big.bin");
+    std::fs::write(&local, &payload).unwrap();
+
+    // hand-driven upload that dies halfway (no end-of-stream marker)
+    let mut s = raw(&d.addr, Cred::Code { code: "RESUME".into(), password: None }, &me_raw).await;
+    let size = payload.len() as u64;
+    let begin = Msg::PutBegin { path: "big.bin".into(), size, offset: 0, len: size, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    assert_eq!(expect_resume(&mut s).await.0, 0);
+    proto::send_data(&mut s, &payload[..1024 * 1024]).await.unwrap();
+    drop(s); // abrupt disconnect
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let partial = std::fs::metadata(guard::part_path(&root.join("big.bin"))).unwrap().len();
+    assert!(partial >= 1024 * 1024 && partial < size, "partial file expected, got {partial}");
+
+    // a normal push resumes from wherever the bytes stopped
+    set_code(&d.st, "RESUME2").await;
+    let t = Target::new(d.addr.clone(), Cred::Code { code: "RESUME2".into(), password: None }, None);
+    client::push(&t, me, &[local.display().to_string()], "", Plan { parallel: 4, resume: true , verify: false})
+        .await
+        .unwrap();
+    assert!(std::fs::read(root.join("big.bin")).unwrap() == payload, "resume corrupted the file");
+}
+
+#[tokio::test]
+async fn protocol_abuse_is_answered_with_errors() {
+    let _g = env_lock();
+    let home = home("abuse");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "ABUSE", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // byte ranges are validated, no overflow/panic
+    let mut s = raw(&d.addr, Cred::Code { code: "ABUSE".into(), password: None }, &me).await;
+    let overflow = Msg::PutBegin { path: "o.bin".into(), size: 10, offset: u64::MAX, len: 10, truncate: false };
+    proto::write_msg(&mut s, &overflow).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("overflow"));
+
+    // declaring a range of zero bytes over a stale file, then lying about the size
+    let begin = Msg::PutBegin { path: "p.bin".into(), size: 100, offset: 0, len: 4, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    assert_eq!(expect_resume(&mut s).await.0, 0);
+    proto::send_data(&mut s, b"abcd").await.unwrap();
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+    proto::write_msg(&mut s, &Msg::PutEnd { path: "p.bin".into(), size: 100, mtime: 0, sha256: None }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("incomplete"));
+    assert_eq!(std::fs::metadata(guard::part_path(&root.join("p.bin"))).unwrap().len(), 4);
+
+    // listing a non-existent path
+    proto::write_msg(&mut s, &Msg::List { path: "nope".into() }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("no such path"));
+
+    // reading past EOF returns an empty stream, not an error or a hang
+    std::fs::write(root.join("small.txt"), b"12345").unwrap();
+    let get = Msg::GetBegin { path: "small.txt".into(), offset: 1000, len: 10 };
+    proto::write_msg(&mut s, &get).await.unwrap();
+    let (offset, size) = expect_resume(&mut s).await;
+    assert_eq!((offset, size), (5, 5));
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Data { len } => assert_eq!(len, 0),
+        other => panic!("expected end of stream, got {other:?}"),
+    }
+
+    // writing more bytes than the declared range is refused
+    let begin = Msg::PutBegin { path: "q.bin".into(), size: 4, offset: 0, len: 4, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    expect_resume(&mut s).await;
+    proto::send_data(&mut s, b"0123456789").await.unwrap();
+    assert!(expect_err(&mut s).await.contains("more bytes"));
+
+    // the stream stayed framed: the same connection keeps working
+    proto::write_msg(&mut s, &Msg::List { path: String::new() }).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Entries { items, .. } => assert!(items.iter().any(|e| e.path == "small.txt"), "{items:?}"),
+        other => panic!("connection desynced after an overrun: {other:?}"),
+    }
+
+    // unknown frames and bare garbage close the connection instead of wedging it
+    set_code(&d.st, "ABUSE2").await;
+    let session = mint_session(&d.addr, Cred::Code { code: "ABUSE2".into(), password: None }, &me).await;
+    let mut t = raw(&d.addr, Cred::Session { token: session }, &me).await;
+    t.write_all(&5u32.to_le_bytes()).await.unwrap();
+    t.write_all(b"garba").await.unwrap();
+    assert!(proto::read_msg(&mut t).await.is_err(), "garbage must close the connection");
+}
+
+// ------------------------------------------------------------------ ipv6
+
