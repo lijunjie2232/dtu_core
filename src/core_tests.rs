@@ -867,3 +867,255 @@ async fn client_helpers_behave_on_edges() {
 
 // -------------------------------------------------------- code rotation
 
+#[tokio::test]
+async fn rotating_the_code_invalidates_the_old_one() {
+    let _g = env_lock();
+    let home = home("rotate");
+    let d = daemon(&home, &home.join("root"), "FIRST", |c| c.code_rotate_on_connect = true).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    drop(raw(&d.addr, Cred::Code { code: "FIRST".into(), password: None }, &me).await);
+    let fresh = d.st.code.lock().await.code.clone();
+    assert_ne!(fresh, "FIRST", "code should have rotated");
+
+    let r = raw_denied(&d.addr, Cred::Code { code: "FIRST".into(), password: None }, &me).await;
+    assert!(r.contains("wrong pairing code"), "{r}");
+    drop(raw(&d.addr, Cred::Code { code: fresh, password: None }, &me).await);
+}
+
+// --------------------------------------------------------- invitations
+
+#[tokio::test]
+async fn invite_deny_timeout_and_mixed_versions() {
+    let _g = env_lock();
+    let home = home("invite-paths");
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // deny: the peer answers Deny
+    let b = daemon(&home, &home.join("b-deny"), "unused", |_| {}).await;
+    let decider = b.st.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let pending = decider.invites.lock().await.first().map(|p| p.id.clone());
+            if let Some(id) = pending {
+                let _ = crate::invite::decide(&decider, &id, Decision::Deny).await;
+                return;
+            }
+        }
+    });
+    let err = client::invite_send(&b.addr, identity::now() + 600, None, &me, &mut Store::default(), 47000, |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(err.contains("denied"), "{err}");
+    assert!(crate::invite::list(&b.st).await.is_empty(), "answered invites must not linger");
+    assert!(b.st.trust.lock().await.devices.is_empty(), "a denied invite must not create trust");
+
+    // timeout: nobody answers within invite_timeout
+    let slow = daemon(&home, &home.join("b-slow"), "unused", |c| c.invite_timeout = 1).await;
+    let err = client::invite_send(&slow.addr, identity::now() + 600, None, &me, &mut Store::default(), 47000, |_, _| {})
+        .await
+        .unwrap_err();
+    assert!(err.contains("timeout"), "{err}");
+    assert!(crate::invite::list(&slow.st).await.is_empty());
+
+    // a mixed-version invitation is refused before it can create trust
+    let mut s = TcpStream::connect(&b.addr).await.unwrap();
+    let inv = Msg::Invite {
+        proto: 99,
+        from: me.id.clone(),
+        pubkey: me.pubkey(),
+        expires_at: identity::now() + 600,
+        note: None,
+        port: 0,
+    };
+    proto::write_msg(&mut s, &inv).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Err { code, msg } => {
+            assert_eq!(code, "protocol", "{msg}");
+            assert!(msg.contains("protocol mismatch"), "{msg}");
+        }
+        other => panic!("expected a version refusal, got {other:?}"),
+    }
+    assert!(crate::invite::list(&b.st).await.is_empty(), "no pending entry for a bad version");
+    let log = std::fs::read_to_string(home.join("auth.log")).unwrap();
+    assert!(log.contains("\"method\":\"proto\""), "{log}");
+}
+
+// ------------------------------------------------------- hostile input
+
+#[tokio::test]
+async fn malformed_hellos_are_rejected_without_panic() {
+    let _g = env_lock();
+    let home = home("hello");
+    let d = daemon(&home, &home.join("root"), "REAL", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    let cases: Vec<(&str, String, String, Cred)> = vec![
+        ("empty id", String::new(), me.pubkey(), Cred::Any),
+        ("id only", "id".into(), me.pubkey(), Cred::Any),
+        ("pubkey not base64", me.id.clone(), "!!!not base64!!!".into(), Cred::Any),
+        ("pubkey wrong length", me.id.clone(), "c2hvcnQ".into(), Cred::Any),
+        ("empty token", me.id.clone(), me.pubkey(), Cred::Token { token: String::new() }),
+        ("token garbage", me.id.clone(), me.pubkey(), Cred::Token { token: "a.b.c".into() }),
+        ("session garbage", me.id.clone(), me.pubkey(), Cred::Session { token: "nope".into() }),
+        ("empty code", me.id.clone(), me.pubkey(), Cred::Code { code: String::new(), password: None }),
+    ];
+    for (label, id, pubkey, cred) in cases {
+        let mut s = TcpStream::connect(&d.addr).await.unwrap();
+        proto::write_msg(&mut s, &Msg::Hello { proto: proto::PROTO, id, pubkey, cred, nonce: 0 }).await.unwrap();
+        match proto::read_msg(&mut s).await {
+            Ok(Msg::AuthFail { .. }) | Err(_) => {}
+            Ok(other) => panic!("{label}: expected rejection, got {other:?}"),
+        }
+    }
+
+    // still serving after all that
+    d.st.fails.lock().await.clear();
+    drop(raw(&d.addr, Cred::Code { code: "REAL".into(), password: None }, &me).await);
+}
+
+#[tokio::test]
+async fn wrong_targets_and_frames_are_reported() {
+    let _g = env_lock();
+    let home = home("targets");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "TGT", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "TGT".into(), password: None }, &me).await;
+
+    // finishing a transfer that never started
+    proto::write_msg(&mut s, &Msg::PutEnd { path: "missing.bin".into(), size: 1, mtime: 0, sha256: None }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("open"));
+
+    // reading a directory, listing a missing path
+    std::fs::create_dir_all(root.join("adir")).unwrap();
+    let get = Msg::GetBegin { path: "adir".into(), offset: 0, len: 10 };
+    proto::write_msg(&mut s, &get).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("directory"));
+    proto::write_msg(&mut s, &Msg::List { path: "missing".into() }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("no such path"));
+
+    // unknown frame type
+    proto::write_msg(&mut s, &Msg::Accept { token: "x".into() }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("unexpected frame"));
+
+    // nested directories are created on demand, and the connection survives all of it
+    let begin = Msg::PutBegin { path: "a/b/c/new.bin".into(), size: 2, offset: 0, len: 2, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    assert_eq!(expect_resume(&mut s).await.0, 0);
+    proto::send_data(&mut s, b"hi").await.unwrap();
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+    proto::write_msg(&mut s, &Msg::PutEnd { path: "a/b/c/new.bin".into(), size: 2, mtime: 0, sha256: None })
+        .await
+        .unwrap();
+    expect_ok(&mut s).await;
+    assert_eq!(std::fs::read(root.join("a/b/c/new.bin")).unwrap(), b"hi");
+
+    proto::write_msg(&mut s, &Msg::List { path: String::new() }).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Entries { items, .. } => {
+            assert_eq!(items.iter().filter(|e| !e.dir).count(), 1, "{items:?}");
+            // the nested directories created for a/b/c/new.bin are listed too
+            assert!(items.iter().any(|e| e.dir && e.path == "a/b/c"), "{items:?}");
+        }
+        other => panic!("expected entries, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn random_frames_never_wedge_the_daemon() {
+    let _g = env_lock();
+    let home = home("fuzz");
+    let d = daemon(&home, &home.join("root"), "unused", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    // a real session: code auth, then reuse the token it hands back
+    set_code(&d.st, "FUZZ").await;
+    let session = mint_session(&d.addr, Cred::Code { code: "FUZZ".into(), password: None }, &me).await;
+
+    for round in 0..40 {
+        let mut s = TcpStream::connect(&d.addr).await.unwrap();
+        let hello = Msg::Hello {
+            proto: proto::PROTO,
+            id: me.id.clone(),
+            pubkey: me.pubkey(),
+            cred: Cred::Session { token: session.clone() },
+            nonce: round,
+        };
+        proto::write_msg(&mut s, &hello).await.unwrap();
+        assert!(matches!(proto::read_msg(&mut s).await.unwrap(), Msg::HelloOk { .. }));
+
+        // a well-framed but meaningless payload, then silence
+        let junk = identity::random_code(16 + round as usize);
+        s.write_all(&(junk.len() as u32).to_le_bytes()).await.unwrap();
+        s.write_all(junk.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), proto::read_msg(&mut s)).await;
+    }
+
+    // the daemon is unharmed
+    set_code(&d.st, "STILL").await;
+    let items = client::list(&target(&d, "STILL"), &me, "").await.unwrap();
+    assert!(items.is_empty());
+}
+
+#[tokio::test]
+async fn dry_run_never_touches_files() {
+    let _g = env_lock();
+    let home = home("dry");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "DRY", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "DRY");
+    let plan = Plan { parallel: 2, resume: true , verify: false};
+
+    std::fs::write(work.join("mine.txt"), b"local").unwrap();
+    client::push(&t, me.clone(), &[work.join("mine.txt").display().to_string()], "d", plan)
+        .await
+        .unwrap();
+    std::fs::write(root.join("d/theirs.txt"), b"remote").unwrap();
+    std::fs::write(work.join("new-local.txt"), b"fresh").unwrap();
+
+    let log = client::sync(&t, me.clone(), &work.display().to_string(), "d", client::SyncOpts { prefer: Prefer::Newer, dry_run: true, delete: client::DeleteSide::None }, plan)
+        .await
+        .unwrap();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert!(log.iter().all(|l| l.contains("dry run")), "{log:?}");
+
+    assert!(!root.join("d/new-local.txt").exists(), "dry run pushed a file");
+    assert!(!work.join("theirs.txt").exists(), "dry run pulled a file");
+    assert_eq!(std::fs::read(root.join("d/mine.txt")).unwrap(), b"local");
+}
+
+// ------------------------------------------------------------- config
+
+#[tokio::test]
+async fn protocol_version_mismatch_is_explained() {
+    let _g = env_lock();
+    let home = home("proto");
+    let d = daemon(&home, &home.join("root"), "unused", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    for bogus in [0u32, 99] {
+        let mut s = TcpStream::connect(&d.addr).await.unwrap();
+        let hello = Msg::Hello { proto: bogus, id: me.id.clone(), pubkey: me.pubkey(), cred: Cred::Any, nonce: 0 };
+        proto::write_msg(&mut s, &hello).await.unwrap();
+        match proto::read_msg(&mut s).await.unwrap() {
+            Msg::AuthFail { reason } => {
+                assert!(reason.contains("protocol mismatch"), "{reason}");
+                assert!(reason.contains(&format!("v{bogus}")), "{reason}");
+            }
+            other => panic!("expected a version refusal, got {other:?}"),
+        }
+    }
+    let log = std::fs::read_to_string(home.join("auth.log")).unwrap();
+    assert!(log.contains("\"method\":\"proto\""), "{log}");
+
+    // the current version still works
+    set_code(&d.st, "OK").await;
+    drop(raw(&d.addr, Cred::Code { code: "OK".into(), password: None }, &me).await);
+}
+
