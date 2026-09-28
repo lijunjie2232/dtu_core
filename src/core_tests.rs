@@ -1119,3 +1119,232 @@ async fn protocol_version_mismatch_is_explained() {
     drop(raw(&d.addr, Cred::Code { code: "OK".into(), password: None }, &me).await);
 }
 
+#[tokio::test]
+async fn expired_session_falls_back_to_the_trusted_token() {
+    let _g = env_lock();
+    let home = home("session");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // sessions expire after a second, so a second push must fall back
+    let d = daemon(&home, &root, "unused", |c| c.session_ttl = 1).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+
+    let token = jwt::sign(&d.st.id, &me.id, identity::now() + 86_400);
+    {
+        let mut t = d.st.trust.lock().await;
+        t.insert(&me.id, &me.pubkey(), &token.clone(), identity::now() + 86_400, None);
+    }
+    let t = Target::new(
+        d.addr.clone(),
+        Cred::Token { token },
+        // the pin is the *peer's* identity, checked after the handshake
+        Some((d.st.id.id.clone(), d.st.id.pubkey())),
+    );
+    let plan = Plan { parallel: 2, resume: true , verify: false};
+
+    std::fs::write(work.join("a.txt"), b"first").unwrap();
+    client::push(&t, me.clone(), &[work.join("a.txt").display().to_string()], "s", plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("s/a.txt")).unwrap(), b"first");
+
+    tokio::time::sleep(Duration::from_millis(1200)).await; // the cached session is now stale
+
+    std::fs::write(work.join("b.txt"), b"second").unwrap();
+    client::push(&t, me.clone(), &[work.join("b.txt").display().to_string()], "s", plan)
+        .await
+        .expect("stale session must fall back to the trusted token");
+    assert_eq!(std::fs::read(root.join("s/b.txt")).unwrap(), b"second");
+}
+
+#[tokio::test]
+async fn silent_connections_are_dropped_by_the_watchdog() {
+    let _g = env_lock();
+    let home = home("idle");
+    let d = daemon(&home, &home.join("root"), "IDLE", |c| c.idle_timeout = 1).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    let mut s = raw(&d.addr, Cred::Code { code: "IDLE".into(), password: None }, &me).await;
+    let started = std::time::Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(5), proto::read_msg(&mut s)).await;
+    assert!(matches!(r, Ok(Err(_))), "silent connection must be closed, got {r:?}");
+    assert!(started.elapsed() < Duration::from_secs(4), "watchdog too slow: {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn audit_log_rotates_and_keeps_the_newest_lines() {
+    let _g = env_lock();
+    let home = home("rotate-log");
+    let path = crate::cfg::file("auth.log");
+    assert!(path.starts_with(&home));
+    std::fs::write(&path, vec![b'x'; (1 << 20) + 16]).unwrap();
+
+    crate::audit::log("t", "ok", "test", None, "-", None);
+
+    assert!(crate::cfg::file("auth.log.1").exists(), "old log should be rotated");
+    let current = std::fs::metadata(&path).unwrap().len();
+    assert!(current < 4096, "fresh log should be small, got {current}");
+    let tail = crate::audit::tail(1);
+    assert_eq!(tail.len(), 1);
+    assert!(tail[0].contains("\"event\":\"t\""), "{tail:?}");
+
+    // the diagnostic helper shares the same sink
+    crate::audit::note("panic: synthetic");
+    let tail = crate::audit::tail(1);
+    assert!(tail[0].contains("synthetic"), "{tail:?}");
+}
+
+#[tokio::test]
+async fn paths_past_the_windows_limit_still_work() {
+    let _g = env_lock();
+    let home = home("long");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "LONG", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+
+    let seg = "d".repeat(110);
+    let remote_dir = format!("{seg}/{seg}");
+    let absolute = d.st.root.join(&seg).join(&seg).join("deep.txt");
+    assert!(
+        absolute.to_string_lossy().len() > 260,
+        "test is pointless below MAX_PATH: {}",
+        absolute.to_string_lossy().len()
+    );
+
+    std::fs::write(work.join("deep.txt"), b"deep file").unwrap();
+    let t = target(&d, "LONG");
+    client::push(&t, me.clone(), &[work.join("deep.txt").display().to_string()], &remote_dir, Plan { parallel: 2, resume: true , verify: false})
+        .await
+        .expect("long remote path must be writable");
+    assert_eq!(std::fs::read(&absolute).unwrap(), b"deep file");
+
+    // and it can be listed and pulled back
+    let items = client::list(&t, &me, &seg).await.unwrap();
+    assert!(items.iter().any(|e| e.path.ends_with("deep.txt")), "{items:?}");
+    let back = home.join("back");
+    client::pull(&t, me, &[format!("{seg}/{seg}/deep.txt")], &back.to_string_lossy(), Plan { parallel: 2, resume: true , verify: false})
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(back.join("deep.txt")).unwrap(), b"deep file");
+}
+
+// ------------------------------------------------------------ stress
+
+#[tokio::test]
+async fn watchdog_kills_a_stalled_upload_and_resume_finishes_it() {
+    let _g = env_lock();
+    let home = home("stall");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "W1", |c| c.idle_timeout = 1).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let me_raw = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 247) as u8).collect();
+    let size = payload.len() as u64;
+
+    // start an upload, send one chunk, then go silent
+    let mut s = raw(&d.addr, Cred::Code { code: "W1".into(), password: None }, &me_raw).await;
+    let begin = Msg::PutBegin { path: "stall.bin".into(), size, offset: 0, len: size, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    assert_eq!(expect_resume(&mut s).await.0, 0);
+    proto::send_data(&mut s, &payload[..256 * 1024]).await.unwrap();
+
+    // the daemon must give up on us instead of holding the task forever
+    let r = tokio::time::timeout(Duration::from_secs(5), proto::read_msg(&mut s)).await;
+    match r {
+        Ok(Ok(Msg::Err { msg, .. })) => assert!(msg.contains("no traffic"), "{msg}"),
+        Ok(Err(_)) => {}
+        other => panic!("stalled upload should be dropped, got {other:?}"),
+    }
+    drop(s);
+
+    let partial = std::fs::metadata(guard::part_path(&root.join("stall.bin"))).unwrap().len();
+    assert_eq!(partial, 256 * 1024, "bytes received before the stall must be kept");
+
+    // a normal client resumes from there
+    set_code(&d.st, "W2").await;
+    std::fs::write(work.join("stall.bin"), &payload).unwrap();
+    let t = target(&d, "W2");
+    client::push(&t, me, &[work.join("stall.bin").display().to_string()], "", Plan { parallel: 2, resume: true , verify: false})
+        .await
+        .expect("resume after a watchdog kill");
+    assert!(std::fs::read(root.join("stall.bin")).unwrap() == payload, "resume produced wrong bytes");
+}
+
+#[tokio::test]
+async fn parallel_clients_are_isolated() {
+    let _g = env_lock();
+    let home = home("parallel");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "unused", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+
+    // eight clients, each with its own session token, pushing its own file
+    d.st.code_sessions.lock().await.insert(me.id.clone(), identity::now() + 600);
+    let mut tasks = Vec::new();
+    let mut expected = Vec::new();
+    for i in 0..8u64 {
+        let addr = d.addr.clone();
+        let me = me.clone();
+        let token = jwt::sign(&d.st.id, &me.id, identity::now() + 600 + i);
+        let local = work.join(format!("c{i}.bin"));
+        let body: Vec<u8> = (0..128 * 1024).map(|b| (b % 241) as u8 + i as u8).collect();
+        std::fs::write(&local, &body).unwrap();
+        expected.push((format!("p{i}/c{i}.bin"), body));
+        tasks.push(tokio::spawn(async move {
+            let t = Target::new(addr, Cred::Session { token }, None);
+            let plan = Plan { parallel: 2, resume: true , verify: false};
+            client::push(&t, me, &[local.display().to_string()], &format!("p{i}"), plan).await
+        }));
+    }
+    for (i, task) in tasks.into_iter().enumerate() {
+        task.await.unwrap().unwrap_or_else(|e| panic!("client {i} failed: {e}"));
+    }
+    for (rel, body) in expected {
+        let got = std::fs::read(root.join(&rel)).unwrap();
+        assert!(got == body, "{rel} was corrupted by a concurrent client");
+    }
+}
+
+#[tokio::test]
+async fn sync_operates_on_the_root_itself() {
+    let _g = env_lock();
+    let home = home("root-sync");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join("sub")).unwrap();
+    let d = daemon(&home, &root, "ROOT", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "ROOT");
+    let plan = Plan { parallel: 2, resume: true , verify: false};
+
+    std::fs::write(work.join("top.txt"), b"top").unwrap();
+    std::fs::write(work.join("sub/nested.txt"), b"nested").unwrap();
+    let locals = vec![work.join("top.txt").display().to_string(), work.join("sub").display().to_string()];
+    client::push(&t, me.clone(), &locals, "", plan).await.unwrap();
+    assert_eq!(std::fs::read(root.join("top.txt")).unwrap(), b"top");
+    assert_eq!(std::fs::read(root.join("sub/nested.txt")).unwrap(), b"nested");
+
+    // remote "" means the served root
+    assert!(client::diff(&t, &me, &work.display().to_string(), "").await.unwrap().is_empty());
+    assert!(client::sync(&t, me.clone(), &work.display().to_string(), "", client::SyncOpts { prefer: Prefer::Newer, dry_run: false, delete: client::DeleteSide::None }, plan)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let out = home.join("out");
+    client::pull(&t, me, &["top.txt".to_string()], &out.display().to_string(), plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(out.join("top.txt")).unwrap(), b"top");
+}
+
+// ------------------------------------------- windows quirks and promises
+
