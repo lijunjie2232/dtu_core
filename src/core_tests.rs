@@ -641,3 +641,229 @@ async fn protocol_abuse_is_answered_with_errors() {
 
 // ------------------------------------------------------------------ ipv6
 
+#[tokio::test]
+async fn ipv6_end_to_end() {
+    let _g = env_lock();
+    let home = home("v6");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let listener = match TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("skipping: no IPv6 loopback ({e})");
+            return;
+        }
+    };
+    let port = listener.local_addr().unwrap().port();
+    let d = daemon_on(listener, &home, &root, "V6", |_| {}).await;
+    let addr = format!("[::1]:{port}");
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let plan = Plan { parallel: 2, resume: true , verify: false};
+
+    std::fs::write(work.join("v6.txt"), b"over ipv6").unwrap();
+    let t = Target::new(addr.clone(), Cred::Code { code: "V6".into(), password: None }, None);
+    client::push(&t, me.clone(), &[work.join("v6.txt").display().to_string()], "in", plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("in/v6.txt")).unwrap(), b"over ipv6");
+
+    let items = client::list(&t, &me, "in").await.unwrap();
+    assert_eq!(items.len(), 1);
+
+    let back = home.join("back");
+    client::pull(&t, me, &["in/v6.txt".to_string()], &back.display().to_string(), plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(back.join("v6.txt")).unwrap(), b"over ipv6");
+    assert_eq!(d.st.cfg.port, port);
+}
+
+// ------------------------------------------------------- in-process core
+
+#[tokio::test]
+async fn the_core_answers_requests_in_process() {
+    let _g = env_lock();
+    let home = home("reqs");
+    let cfg = Config {
+        root: home.join("root").to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let id = Identity::load_or_create_at(&home.join("d.json")).unwrap();
+    let st = State::new(cfg, id, Store::default());
+
+    match server::control_handle(&st, Ctrl::Status).await {
+        Ctrl::StatusOk { id: got, version, proto, trusted, pending, .. } => {
+            assert_eq!(got, st.id.id);
+            assert_eq!((trusted, pending), (0, 0));
+            assert_eq!(proto, proto::PROTO);
+            assert!(!version.is_empty(), "status should report the build version");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // a refresh rotates the code and keeps the password it was given
+    match server::control_handle(&st, Ctrl::CodeRefresh { password: Some("pw".into()) }).await {
+        Ctrl::Code { password, consumed, code } => {
+            assert!(password);
+            assert!(!consumed);
+            assert_eq!(code.len(), 8);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match server::control_handle(&st, Ctrl::Invites).await {
+        Ctrl::InvitesOk { items } => assert!(items.is_empty()),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+// --------------------------------------------------------- diff and sync
+
+#[tokio::test]
+async fn diff_and_sync_resolve_conflicts_predictably() {
+    let _g = env_lock();
+    let home = home("sync");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join("sub")).unwrap();
+    let d = daemon(&home, &root, "SYNC", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "SYNC");
+    let plan = Plan { parallel: 4, resume: true , verify: false};
+
+    std::fs::write(work.join("same.txt"), b"identical").unwrap();
+    std::fs::write(work.join("conflict.txt"), b"local-side").unwrap();
+    std::fs::write(work.join("sub/local-only.txt"), b"only here").unwrap();
+    let locals = vec![work.join("same.txt").display().to_string(), work.join("sub").display().to_string()];
+    client::push(&t, me.clone(), &locals, "s", plan).await.unwrap();
+
+    // remote gets a different, explicitly newer version of conflict.txt
+    std::fs::write(root.join("s/conflict.txt"), b"remote-side-newer").unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(root.join("s/conflict.txt")).unwrap();
+    f.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(identity::now() + 500)).unwrap();
+    drop(f);
+
+    // remote-only file shows up as '-', a file created after the push shows up as '+'
+    std::fs::write(root.join("s/remote-only.txt"), b"remote").unwrap();
+    std::fs::write(work.join("late.txt"), b"appeared later").unwrap();
+
+    let rows = client::diff(&t, &me, &work.display().to_string(), "s").await.unwrap();
+    let kinds: Vec<(char, &str)> = rows.iter().map(|r| (r.kind, r.rel.as_str())).collect();
+    assert!(kinds.contains(&('~', "conflict.txt")), "{kinds:?}");
+    assert!(kinds.contains(&('-', "remote-only.txt")), "{kinds:?}");
+    assert!(kinds.contains(&('+', "late.txt")), "{kinds:?}");
+    assert!(!kinds.iter().any(|(_, r)| *r == "same.txt"), "identical files must not be listed");
+    assert!(!kinds.iter().any(|(_, r)| *r == "sub/local-only.txt"), "synced files must not be listed");
+
+    // newest wins: the remote copy is newer, so it is pulled
+    let act = client::sync(&t, me.clone(), &work.display().to_string(), "s", client::SyncOpts { prefer: Prefer::Newer, dry_run: true, delete: client::DeleteSide::None }, plan)
+        .await
+        .unwrap();
+    assert!(act.iter().any(|l| l.starts_with("pull") && l.contains("conflict.txt")), "{act:?}");
+
+    client::sync(&t, me.clone(), &work.display().to_string(), "s", client::SyncOpts { prefer: Prefer::Newer, dry_run: false, delete: client::DeleteSide::None }, plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(work.join("conflict.txt")).unwrap(), b"remote-side-newer");
+    assert_eq!(std::fs::read(work.join("remote-only.txt")).unwrap(), b"remote");
+    assert_eq!(std::fs::read(root.join("s/late.txt")).unwrap(), b"appeared later");
+    assert_eq!(std::fs::read(root.join("s/sub/local-only.txt")).unwrap(), b"only here");
+    assert!(client::diff(&t, &me, &work.display().to_string(), "s").await.unwrap().is_empty());
+
+    // Prefer::Local forces a push even when the remote is newer
+    std::fs::write(work.join("conflict.txt"), b"forced-local").unwrap();
+    client::sync(&t, me.clone(), &work.display().to_string(), "s", client::SyncOpts { prefer: Prefer::Local, dry_run: false, delete: client::DeleteSide::None }, plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("s/conflict.txt")).unwrap(), b"forced-local");
+
+    // Prefer::Remote forces a pull
+    std::fs::write(work.join("conflict.txt"), b"local-again").unwrap();
+    client::sync(&t, me.clone(), &work.display().to_string(), "s", client::SyncOpts { prefer: Prefer::Remote, dry_run: false, delete: client::DeleteSide::None }, plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(work.join("conflict.txt")).unwrap(), b"forced-local");
+}
+
+// --------------------------------------------------------- client helpers
+
+#[tokio::test]
+async fn client_helpers_behave_on_edges() {
+    let _g = env_lock();
+
+    // range splitting must tile the file exactly, for any size and width
+    for size in [0u64, 1, 7, client::CHUNK_MIN - 1, client::CHUNK_MIN, client::CHUNK_MIN + 1, 3 * client::CHUNK_MIN, 10 * client::CHUNK_MIN + 123] {
+        for parallel in [0usize, 1, 2, 4, 16] {
+            let r = client::ranges(size, parallel);
+            assert!(!r.is_empty(), "size={size} p={parallel}");
+            if size == 0 {
+                assert_eq!(r, vec![(0, 0)]);
+                continue;
+            }
+            assert_eq!(r[0].0, 0, "size={size} p={parallel}");
+            assert_eq!(r.last().unwrap().1, size, "size={size} p={parallel}");
+            assert!(r.windows(2).all(|w| w[0].1 == w[1].0), "gap at {r:?}");
+            assert!(r.len() <= parallel.max(1), "too many streams: {r:?}");
+        }
+    }
+
+    // address forms a human might type
+    for (input, expected) in [
+        ("host", 47000),
+        ("host:99", 99),
+        ("1.2.3.4", 47000),
+        ("http://host:1234/", 1234),
+        ("https://host", 47000),
+        ("::1", 47000),
+        ("[::1]", 47000),
+        ("[::1]:88", 88),
+        ("[fe80::1%12]", 47000),
+    ] {
+        let got = client::normalize_addr(input, 47000);
+        assert_eq!(got, format!("{}:{}", got.rsplit_once(':').map(|(h, _)| h).unwrap_or(&got), expected), "{input} -> {got}");
+        assert!(got.ends_with(&format!(":{expected}")), "{input} -> {got}");
+    }
+
+    // peer resolution: trusted, expired, unknown, trusted-without-address
+    let cfg = Config::default();
+    let now = identity::now();
+    let mut trust = Store::default();
+    trust.insert("dev1", "key1", "tok1", now + 600, Some("1.2.3.4:47000".into()));
+    trust.insert("old", "key2", "tok2", now - 10, Some("1.2.3.5:47000".into()));
+    trust.insert("noaddr", "key3", "tok3", 0, None);
+
+    let ok = Target::resolve(&cfg, &trust, "dev1", None, None).unwrap();
+    assert_eq!(ok.addr, "1.2.3.4:47000");
+    assert_eq!(ok.pin, Some(("dev1".to_string(), "key1".to_string())));
+    assert!(matches!(ok.cred, Cred::Token { .. }));
+
+    assert!(Target::resolve(&cfg, &trust, "old", None, None).unwrap_err().contains("expired"));
+    assert!(Target::resolve(&cfg, &trust, "ghost", None, None).unwrap_err().contains("not trusted"));
+    assert!(Target::resolve(&cfg, &trust, "noaddr", None, None).unwrap_err().contains("no known address"));
+    let by_addr = Target::resolve(&cfg, &trust, "10.0.0.9:5000", Some("ABCD"), None).unwrap();
+    assert_eq!(by_addr.addr, "10.0.0.9:5000");
+    assert!(by_addr.pin.is_none());
+
+    // an alias stands in for the id everywhere a peer is named
+    trust.set_alias("dev1", Some("laptop")).unwrap();
+    let by_alias = Target::resolve(&cfg, &trust, "LAPTOP", None, None).unwrap();
+    assert_eq!(by_alias.addr, "1.2.3.4:47000");
+    assert_eq!(by_alias.pin, Some(("dev1".to_string(), "key1".to_string())));
+    assert_eq!(trust.resolve("laptop").map(|(id, _)| id), Some("dev1"));
+    // unique: neither another device's alias nor any device id is allowed
+    assert!(trust.set_alias("noaddr", Some("Laptop")).unwrap_err().contains("already used"));
+    assert!(trust.set_alias("noaddr", Some("old")).unwrap_err().contains("device id"));
+    // re-pairing keeps our name, and an empty name clears it
+    trust.insert("dev1", "key1b", "tok1b", now + 600, None);
+    assert_eq!(trust.devices["dev1"].alias.as_deref(), Some("laptop"));
+    trust.set_alias("dev1", Some("")).unwrap();
+    assert!(trust.devices["dev1"].alias.is_none());
+
+    // preference parsing
+    assert_eq!(Prefer::parse("newer").unwrap(), Prefer::Newer);
+    assert_eq!(Prefer::parse("LOCAL").unwrap(), Prefer::Local);
+    assert!(Prefer::parse("whatever").is_err());
+}
+
+// -------------------------------------------------------- code rotation
+
