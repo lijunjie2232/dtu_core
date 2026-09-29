@@ -1514,3 +1514,205 @@ async fn refreshing_the_code_does_not_break_running_transfers() {
 
 // ------------------------------------------------ staging and integrity
 
+#[tokio::test]
+async fn partial_uploads_are_staged_then_landed() {
+    let _g = env_lock();
+    let home = home("stage");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "STG", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let final_path = root.join("stage.bin");
+    let part = guard::part_path(&final_path);
+
+    // leave an upload half done
+    let mut s = raw(&d.addr, Cred::Code { code: "STG".into(), password: None }, &me).await;
+    let begin = Msg::PutBegin { path: "stage.bin".into(), size: 10, offset: 0, len: 10, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    assert_eq!(expect_resume(&mut s).await.0, 0);
+    proto::send_data(&mut s, b"abcd").await.unwrap();
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert!(!final_path.exists(), "a partial upload must not appear under its final name");
+    assert_eq!(std::fs::metadata(&part).unwrap().len(), 4, "the partial must be kept for resume");
+
+    // the in-progress file is invisible to listing/diff
+    set_code(&d.st, "STG1").await;
+    let items = client::list(&target(&d, "STG1"), &me, "").await.unwrap();
+    assert!(items.is_empty(), "partials leaked into the listing: {items:?}");
+
+    // finishing lands it under the final name and removes the staging file
+    set_code(&d.st, "STG2").await;
+    let mut s = raw(&d.addr, Cred::Code { code: "STG2".into(), password: None }, &me).await;
+    let begin = Msg::PutBegin { path: "stage.bin".into(), size: 10, offset: 4, len: 6, truncate: false };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    assert_eq!(expect_resume(&mut s).await.0, 4, "resume must pick up the staged bytes");
+    proto::send_data(&mut s, b"efghij").await.unwrap();
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+    let end = Msg::PutEnd { path: "stage.bin".into(), size: 10, mtime: 0, sha256: None };
+    proto::write_msg(&mut s, &end).await.unwrap();
+    expect_ok(&mut s).await;
+
+    assert_eq!(std::fs::read(&final_path).unwrap(), b"abcdefghij");
+    assert!(!part.exists(), "staging file must be gone after landing");
+}
+
+#[tokio::test]
+async fn checksum_mismatch_discards_the_upload() {
+    let _g = env_lock();
+    let home = home("checksum");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "SUM", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "SUM".into(), password: None }, &me).await;
+
+    let begin = Msg::PutBegin { path: "bad.bin".into(), size: 4, offset: 0, len: 4, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    expect_resume(&mut s).await;
+    proto::send_data(&mut s, b"abcd").await.unwrap();
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+
+    let end = Msg::PutEnd {
+        path: "bad.bin".into(),
+        size: 4,
+        mtime: 0,
+        sha256: Some(identity::b64e(&[0u8; 32])),
+    };
+    proto::write_msg(&mut s, &end).await.unwrap();
+    let (code, msg) = expect_err_coded(&mut s).await;
+    assert_eq!(code, "checksum", "{msg}");
+    assert!(!root.join("bad.bin").exists(), "a corrupt file must not land");
+    assert!(!guard::part_path(&root.join("bad.bin")).exists(), "corrupt staging file must be discarded");
+
+    // and a correct digest does land
+    set_code(&d.st, "SUM2").await;
+    let session = mint_session(&d.addr, Cred::Code { code: "SUM2".into(), password: None }, &me).await;
+    let mut s = raw(&d.addr, Cred::Session { token: session }, &me).await;
+    let begin = Msg::PutBegin { path: "good.bin".into(), size: 4, offset: 0, len: 4, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    expect_resume(&mut s).await;
+    proto::send_data(&mut s, b"abcd").await.unwrap();
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+    std::fs::write(root.join("local-src"), b"abcd").unwrap();
+    let digest = guard::sha256_file(&root.join("local-src")).unwrap();
+    let end = Msg::PutEnd { path: "good.bin".into(), size: 4, mtime: 0, sha256: Some(digest) };
+    proto::write_msg(&mut s, &end).await.unwrap();
+    expect_ok(&mut s).await;
+    assert_eq!(std::fs::read(root.join("good.bin")).unwrap(), b"abcd");
+}
+
+#[tokio::test]
+async fn pull_resumes_from_the_local_partial() {
+    let _g = env_lock();
+    let home = home("pull-resume");
+    let root = home.join("root");
+    let work = home.join("work");
+    let out = home.join("out");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = daemon(&home, &root, "PR", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "PR");
+    let plan = Plan { parallel: 2, resume: true , verify: false};
+
+    let payload: Vec<u8> = (0..96 * 1024).map(|i| (i % 233) as u8).collect();
+    std::fs::write(work.join("p.bin"), &payload).unwrap();
+    client::push(&t, me.clone(), &[work.join("p.bin").display().to_string()], "", plan)
+        .await
+        .unwrap();
+
+    // half the file already downloaded: the rest must be fetched, then landed
+    let local = out.join("p.bin");
+    let part = guard::part_path(&local);
+    std::fs::write(&part, &payload[..payload.len() / 2]).unwrap();
+    client::pull(&t, me, &["p.bin".to_string()], &out.display().to_string(), plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&local).unwrap(), payload);
+    assert!(!part.exists(), "staging file must be gone after landing");
+}
+
+#[tokio::test]
+async fn large_listings_are_chunked() {
+    let _g = env_lock();
+    let home = home("biglist");
+    let root = home.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = daemon(&home, &root, "BL", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // more than one LIST_CHUNK (1000) worth of entries
+    for i in 0..2500 {
+        std::fs::write(root.join(format!("f{i:04}.txt")), b"x").unwrap();
+    }
+    let items = client::list(&target(&d, "BL"), &me, "").await.unwrap();
+    assert_eq!(items.len(), 2500, "chunked listing must be reassembled");
+    assert!(items.iter().any(|e| e.path == "f2499.txt"));
+}
+
+// ------------------------------------------------- guards and limits
+
+#[tokio::test]
+async fn one_data_dir_one_daemon() {
+    let _g = env_lock();
+    let _home = home("lock");
+    let first = server::acquire_data_lock().expect("first lock");
+    assert!(server::acquire_data_lock().is_err(), "a second daemon must be refused");
+    drop(first);
+    assert!(server::acquire_data_lock().is_ok(), "lock must be released with the handle");
+}
+
+#[tokio::test]
+async fn connections_per_ip_are_capped() {
+    let _g = env_lock();
+    let home = home("ipcap");
+    let d = daemon(&home, &home.join("root"), "CAP", |c| c.max_conn_per_ip = 2).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    let first = TcpStream::connect(&d.addr).await.unwrap();
+    let second = TcpStream::connect(&d.addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // this one is accepted by the OS and then dropped by the daemon
+    let mut third = TcpStream::connect(&d.addr).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(3), proto::read_msg(&mut third)).await;
+    assert!(matches!(r, Ok(Err(_))), "connection over the cap must be dropped, got {r:?}");
+
+    // freeing a slot lets the same address back in
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(second);
+    drop(raw(&d.addr, Cred::Code { code: "CAP".into(), password: None }, &me).await);
+}
+
+#[tokio::test]
+async fn revoking_a_device_takes_effect_immediately() {
+    let _g = env_lock();
+    let home = home("revoke");
+    let d = daemon(&home, &home.join("root"), "unused", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let now = identity::now();
+    let token = jwt::sign(&d.st.id, &me.id, now + 3600);
+    {
+        let mut trust = d.st.trust.lock().await;
+        trust.insert(&me.id, &me.pubkey(), &token.clone(), now + 3600, None);
+        trust.save().unwrap();
+    }
+    drop(raw(&d.addr, Cred::Token { token: token.clone() }, &me).await);
+
+    // `dtu device rm` rewrites trust.json from another process
+    Store::default().save().unwrap();
+    let reason = raw_denied(&d.addr, Cred::Token { token }, &me).await;
+    assert!(reason.contains("unknown device"), "revocation must not wait for a restart: {reason}");
+}
+
+// ------------------------------------------------------ daemon lifecycle
+
+fn free_port() -> u16 {
+    let l = StdListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
