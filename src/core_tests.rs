@@ -1716,3 +1716,251 @@ fn free_port() -> u16 {
     l.local_addr().unwrap().port()
 }
 
+#[tokio::test]
+async fn the_hosted_core_serves_and_stops() {
+    let _g = env_lock();
+    let home = home("hosted");
+    let root = home.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = Config {
+        port: free_port(),
+        root: root.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    crate::cfg::write_json(&crate::cfg::file("config.json"), &cfg).unwrap();
+
+    let daemon = crate::embed::host(cfg.clone()).expect("host the core");
+    daemon.wait_ready().expect("services must come up");
+    assert!(crate::cfg::file("daemon.lock").exists(), "data dir lock file missing");
+    assert!(crate::cfg::file("control.token").exists(), "local key missing");
+
+    // one owner per data dir, checked through the real entry point
+    let dup = crate::embed::host(cfg.clone()).err().expect("a second owner must be refused");
+    assert!(dup.contains("already owns"), "{dup}");
+
+    // it actually serves transfers with the code it is showing
+    let code = daemon.state.code.lock().await.code.clone();
+    let me = Arc::new(Identity::load_or_create_at(&home.join("client.json")).unwrap());
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("hello.txt"), b"through the hosted core").unwrap();
+    let t = Target::new(
+        format!("127.0.0.1:{}", cfg.port),
+        Cred::Code { code, password: None },
+        None,
+    );
+    client::push(
+        &t,
+        me.clone(),
+        &[work.join("hello.txt").display().to_string()],
+        "in",
+        Plan { parallel: 2, resume: true, verify: true },
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(root.join("in/hello.txt")).unwrap(), b"through the hosted core");
+    assert!(!std::fs::read_dir(root.join("in")).unwrap().any(|e| {
+        e.map(|e| e.file_name().to_string_lossy().ends_with(".dtu-part")).unwrap_or(false)
+    }));
+
+    // stopping hands the data dir back
+    daemon.stop();
+    let again = crate::embed::host(cfg).expect("host again after stop");
+    again.wait_ready().expect("services must come back");
+    again.stop();
+}
+
+#[tokio::test]
+async fn revoking_a_device_kills_its_session_too() {
+    let _g = env_lock();
+    let home = home("revoke-session");
+    let d = daemon(&home, &home.join("root"), "unused", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let now = identity::now();
+    let token = jwt::sign(&d.st.id, &me.id, now + 3600);
+    {
+        let mut trust = d.st.trust.lock().await;
+        trust.insert(&me.id, &me.pubkey(), &token.clone(), now + 3600, None);
+        trust.save().unwrap();
+    }
+
+    // a trusted device gets a session from its JWT, and that session works
+    let session = mint_session(&d.addr, Cred::Token { token }, &me).await;
+    drop(raw(&d.addr, Cred::Session { token: session.clone() }, &me).await);
+
+    // `dtu device rm` rewrites trust.json from another process
+    Store::default().save().unwrap();
+    let reason = raw_denied(&d.addr, Cred::Session { token: session }, &me).await;
+    assert!(
+        reason.contains("no longer trusted"),
+        "a revoked device must lose its live session immediately: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn code_auth_sessions_survive_an_empty_trust_store() {
+    let _g = env_lock();
+    let home = home("code-session");
+    let d = daemon(&home, &home.join("root"), "CS", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // a code-auth device is never in the trust store, but its session must keep
+    // working for the rest of the transfer
+    let session = mint_session(&d.addr, Cred::Code { code: "CS".into(), password: None }, &me).await;
+    Store::default().save().unwrap();
+    drop(raw(&d.addr, Cred::Session { token: session.clone() }, &me).await);
+
+    // once the code session forgets the device, the token is dead
+    d.st.code_sessions.lock().await.clear();
+    let reason = raw_denied(&d.addr, Cred::Session { token: session }, &me).await;
+    assert!(reason.contains("no longer trusted"), "{reason}");
+}
+
+// -------------------------------------------- staging, integrity, framing
+
+#[tokio::test]
+async fn reserved_suffix_is_refused_in_both_directions() {
+    let _g = env_lock();
+    let home = home("reserved-suffix");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "SFX", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "SFX");
+
+    // a local file that would land under the reserved name
+    std::fs::write(work.join("data.bin.dtu-part"), b"x").unwrap();
+    let err = client::push(
+        &t,
+        me.clone(),
+        &[work.join("data.bin.dtu-part").display().to_string()],
+        "r",
+        Plan { parallel: 1, resume: true, verify: false },
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("reserved suffix"), "{err}");
+
+    // and pulling such a name is refused too
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("real.bin"), b"data").unwrap();
+    let out = home.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    set_code(&d.st, "SFX2").await;
+    let mut s = raw(&d.addr, Cred::Code { code: "SFX2".into(), password: None }, &me).await;
+    let get = Msg::GetBegin { path: "real.bin.dtu-part".into(), offset: 0, len: 4 };
+    proto::write_msg(&mut s, &get).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("reserved suffix"));
+}
+
+#[tokio::test]
+async fn pull_discards_an_oversized_staged_file() {
+    let _g = env_lock();
+    let home = home("oversized-part");
+    let root = home.join("root");
+    let work = home.join("work");
+    let out = home.join("out");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = daemon(&home, &root, "OVR", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "OVR");
+    let plan = Plan { parallel: 2, resume: true, verify: false };
+
+    let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 227) as u8).collect();
+    std::fs::write(work.join("o.bin"), &payload).unwrap();
+    client::push(&t, me.clone(), &[work.join("o.bin").display().to_string()], "", plan)
+        .await
+        .unwrap();
+
+    // a stale staging file from some larger transfer must not survive as a prefix
+    let part = guard::part_path(&out.join("o.bin"));
+    std::fs::write(&part, vec![b'Z'; 200 * 1024]).unwrap();
+    client::pull(&t, me, &["o.bin".to_string()], &out.display().to_string(), plan)
+        .await
+        .unwrap();
+    assert!(std::fs::read(out.join("o.bin")).unwrap() == payload, "oversized staging leaked into the file");
+}
+
+#[tokio::test]
+async fn verification_handles_empty_files_and_keeps_good_versions() {
+    let _g = env_lock();
+    let home = home("verify-cases");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "VF", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "VF");
+    let plan = Plan { parallel: 2, resume: true, verify: true };
+
+    // empty file: the digest of nothing must still verify
+    std::fs::write(work.join("empty.bin"), b"").unwrap();
+    client::push(&t, me.clone(), &[work.join("empty.bin").display().to_string()], "", plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::metadata(root.join("empty.bin")).unwrap().len(), 0);
+
+    // a bad upload must not destroy the version already in place
+    std::fs::write(work.join("keep.bin"), b"v1").unwrap();
+    client::push(&t, me.clone(), &[work.join("keep.bin").display().to_string()], "", plan)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("keep.bin")).unwrap(), b"v1");
+
+    set_code(&d.st, "VF2").await;
+    let mut s = raw(&d.addr, Cred::Code { code: "VF2".into(), password: None }, &me).await;
+    let begin = Msg::PutBegin { path: "keep.bin".into(), size: 3, offset: 0, len: 3, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    expect_resume(&mut s).await;
+    proto::send_data(&mut s, b"bad").await.unwrap();
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+    let end = Msg::PutEnd { path: "keep.bin".into(), size: 3, mtime: 0, sha256: Some(identity::b64e(&[7u8; 32])) };
+    proto::write_msg(&mut s, &end).await.unwrap();
+    let (code, msg) = expect_err_coded(&mut s).await;
+    assert_eq!(code, "checksum", "{msg}");
+    assert_eq!(
+        std::fs::read(root.join("keep.bin")).unwrap(),
+        b"v1",
+        "a rejected upload must leave the previous file untouched"
+    );
+}
+
+#[tokio::test]
+async fn list_chunk_boundary_is_exact() {
+    let _g = env_lock();
+    let home = home("chunk-edge");
+    let root = home.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = daemon(&home, &root, "CE", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // one more than a chunk: first frame must be full and flagged `more`
+    for i in 0..1001 {
+        std::fs::write(root.join(format!("e{i:04}.txt")), b"x").unwrap();
+    }
+    let mut s = raw(&d.addr, Cred::Code { code: "CE".into(), password: None }, &me).await;
+    proto::write_msg(&mut s, &Msg::List { path: String::new() }).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Entries { items, more } => {
+            assert_eq!(items.len(), 1000, "first frame should be exactly one chunk");
+            assert!(more, "a second frame should follow");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Entries { items, more } => {
+            assert_eq!(items.len(), 1);
+            assert!(!more);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // the client reassembles the same set
+    set_code(&d.st, "CE2").await;
+    let all = client::list(&target(&d, "CE2"), &me, "").await.unwrap();
+    assert_eq!(all.len(), 1001);
+}
+
