@@ -1348,3 +1348,169 @@ async fn sync_operates_on_the_root_itself() {
 
 // ------------------------------------------- windows quirks and promises
 
+#[tokio::test]
+async fn empty_directories_survive_a_sync() {
+    let _g = env_lock();
+    let home = home("empty-dirs");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join("parent/empty")).unwrap();
+    std::fs::create_dir_all(work.join("only-empty/leaf")).unwrap();
+    std::fs::write(work.join("parent/keep.txt"), b"x").unwrap();
+    std::fs::write(work.join("only-empty/leaf/note.txt"), b"n").unwrap();
+    let d = daemon(&home, &root, "ED", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "ED");
+    let plan = Plan { parallel: 2, resume: true, verify: false };
+
+    // push recreates the empty directories, not just the files
+    let trees = vec![
+        work.join("parent").display().to_string(),
+        work.join("only-empty").display().to_string(),
+    ];
+    client::push(&t, me.clone(), &trees, "", plan).await.unwrap();
+    assert!(root.join("parent/empty").is_dir(), "empty directory was dropped by push");
+    assert!(root.join("only-empty/leaf").is_dir(), "directory-only tree was dropped");
+    assert_eq!(std::fs::read(root.join("parent/keep.txt")).unwrap(), b"x");
+
+    // directories round-trip exactly: no spurious rows, no missing ones
+    assert!(
+        client::diff(&t, &me, &work.display().to_string(), "").await.unwrap().is_empty(),
+        "a pushed tree must compare equal, directories included"
+    );
+
+    // pulling a remote-only empty directory creates it locally
+    std::fs::create_dir_all(root.join("remote-empty/inner")).unwrap();
+    let out = home.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    client::pull(&t, me.clone(), &["remote-empty".to_string()], &out.display().to_string(), plan)
+        .await
+        .unwrap();
+    // same flattening rule as files: the pulled path's own name is dropped
+    assert!(out.join("inner").is_dir(), "pull dropped an empty directory");
+
+    // sync copies it, and is idempotent afterwards
+    let log = client::sync(
+        &t,
+        me.clone(),
+        &work.display().to_string(),
+        "",
+        client::SyncOpts { prefer: Prefer::Newer, dry_run: false, delete: client::DeleteSide::None },
+        plan,
+    )
+    .await
+    .unwrap();
+    assert!(log.iter().any(|l| l.starts_with("pull") && l.contains("remote-empty")), "{log:?}");
+    assert!(work.join("remote-empty/inner").is_dir());
+    assert!(client::diff(&t, &me, &work.display().to_string(), "").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn pull_overwrites_a_longer_local_file() {
+    let _g = env_lock();
+    let home = home("pull-longer");
+    let root = home.join("root");
+    let out = home.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "PL", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "PL");
+    let plan = Plan { parallel: 2, resume: true , verify: false};
+
+    let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 239) as u8).collect();
+    std::fs::write(work.join("x.bin"), &payload).unwrap();
+    client::push(&t, me.clone(), &[work.join("x.bin").display().to_string()], "", plan)
+        .await
+        .unwrap();
+
+    // a longer, staler local copy must end up byte-identical to the remote
+    std::fs::write(out.join("x.bin"), vec![b'Z'; 200 * 1024]).unwrap();
+    client::pull(&t, me, &["x.bin".to_string()], &out.display().to_string(), plan)
+        .await
+        .unwrap();
+    let got = std::fs::read(out.join("x.bin")).unwrap();
+    assert_eq!(got.len(), payload.len(), "stale tail must be truncated");
+    assert!(got == payload, "pull produced wrong bytes");
+}
+
+#[tokio::test]
+async fn windows_reserved_names_are_plain_files() {
+    let _g = env_lock();
+    let home = home("reserved");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // the local side needs verbatim paths to create such names at all
+    let vwork = work.canonicalize().unwrap();
+    let d = daemon(&home, &root, "RES", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "RES");
+
+    for name in ["con.txt", "nul.txt", "aux.txt", "prn.txt", "com1.txt"] {
+        std::fs::write(vwork.join(name), name.as_bytes()).unwrap();
+        client::push(&t, me.clone(), &[vwork.join(name).display().to_string()], "res", Plan { parallel: 1, resume: true , verify: false})
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        // the daemon must have created a regular file, not written to the device
+        let stored = std::fs::read(d.st.root.join("res").join(name)).unwrap();
+        assert_eq!(stored, name.as_bytes(), "{name} was not stored as a regular file");
+    }
+}
+
+#[tokio::test]
+async fn absurdly_long_remote_names_fail_cleanly() {
+    let _g = env_lock();
+    let home = home("toolong");
+    let d = daemon(&home, &home.join("root"), "TL", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "TL".into(), password: None }, &me).await;
+
+    // one component longer than the filesystem allows
+    let name = format!("{}.bin", "n".repeat(300));
+    let begin = Msg::PutBegin { path: name, size: 2, offset: 0, len: 2, truncate: true };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    let msg = expect_err(&mut s).await;
+    assert!(msg.contains("open"), "{msg}");
+
+    // the daemon is unharmed and still framed
+    proto::write_msg(&mut s, &Msg::List { path: String::new() }).await.unwrap();
+    assert!(matches!(proto::read_msg(&mut s).await.unwrap(), Msg::Entries { .. }));
+}
+
+#[tokio::test]
+async fn refreshing_the_code_does_not_break_running_transfers() {
+    let _g = env_lock();
+    let home = home("refresh");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "C1", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "C1");
+    let plan = Plan { parallel: 2, resume: true , verify: false};
+
+    std::fs::write(work.join("a.txt"), b"first").unwrap();
+    client::push(&t, me.clone(), &[work.join("a.txt").display().to_string()], "m", plan)
+        .await
+        .unwrap();
+
+    // the operator refreshes the code mid-session
+    d.st.rotate_code(None).await;
+
+    // the established session keeps working...
+    std::fs::write(work.join("b.txt"), b"second").unwrap();
+    client::push(&t, me.clone(), &[work.join("b.txt").display().to_string()], "m", plan)
+        .await
+        .expect("a refreshed code must not kill the running session");
+    assert_eq!(std::fs::read(root.join("m/b.txt")).unwrap(), b"second");
+
+    // ...while the old code is useless for a newcomer
+    let other = Identity::load_or_create_at(&home.join("other.json")).unwrap();
+    let fresh = Target::new(d.addr.clone(), Cred::Code { code: "C1".into(), password: None }, None);
+    assert!(client::list(&fresh, &other, "m").await.is_err(), "old code must be dead");
+}
+
+// ------------------------------------------------ staging and integrity
+
