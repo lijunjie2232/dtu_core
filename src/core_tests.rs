@@ -2347,3 +2347,158 @@ async fn the_peer_records_completed_ranges() {
     }
 }
 
+#[tokio::test]
+async fn a_middle_gap_is_resumed_without_resending_the_rest() {
+    let _g = env_lock();
+    let home = home("gapresume");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "GR", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+
+    // 24 MB over 3 streams -> three 8 MB ranges
+    let payload: Vec<u8> = (0..24 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let local = work.join("gap.bin");
+    std::fs::write(&local, &payload).unwrap();
+    let size = payload.len() as u64;
+    let grid = client::ranges(size, 3);
+    assert_eq!(grid.len(), 3, "the test needs three ranges: {grid:?}");
+
+    // simulate an interrupted attempt: first and last range already written
+    let me_raw = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "GR".into(), password: None }, &me_raw).await;
+    for (from, to) in [grid[0], grid[2]] {
+        let begin = Msg::PutBegin { path: "gap.bin".into(), size, offset: from, len: to - from, truncate: false };
+        proto::write_msg(&mut s, &begin).await.unwrap();
+        assert_eq!(expect_resume(&mut s).await.0, from);
+        send_bulk(&mut s, &payload[from as usize..to as usize]).await;
+        proto::send_data(&mut s, &[]).await.unwrap();
+        expect_ok(&mut s).await;
+    }
+    drop(s);
+
+    // a normal push only has to fill the hole and land the file
+    set_code(&d.st, "GR2").await;
+    let t = target(&d, "GR2");
+    client::push(&t, me.clone(), &[local.display().to_string()], "", Plan { parallel: 3, resume: true, verify: true })
+        .await
+        .expect("gap resume");
+    assert!(std::fs::read(root.join("gap.bin")).unwrap() == payload, "gap resume produced wrong bytes");
+
+    // the record is gone now
+    let (done, staged, _) = client::ranges_done(&t, &me, "gap.bin").await.unwrap();
+    assert!(done.is_empty() && staged == 0, "{done:?} {staged}");
+}
+
+#[tokio::test]
+async fn gap_resume_trusts_the_record_instead_of_the_bytes() {
+    let _g = env_lock();
+    let home = home("gaptrust");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "GT", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+
+    // 24 MB, three ranges; the first range on the peer holds *different* bytes
+    let payload: Vec<u8> = (0..24 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let local = work.join("gap.bin");
+    std::fs::write(&local, &payload).unwrap();
+    let size = payload.len() as u64;
+    let grid = client::ranges(size, 3);
+    assert_eq!(grid.len(), 3, "{grid:?}");
+    let first = grid[0];
+
+    let me_raw = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "GT".into(), password: None }, &me_raw).await;
+    let begin = Msg::PutBegin { path: "gap.bin".into(), size, offset: first.0, len: first.1 - first.0, truncate: false };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    expect_resume(&mut s).await;
+    send_bulk(&mut s, &vec![b'X'; (first.1 - first.0) as usize]).await;
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+    drop(s);
+
+    // a completed range is not re-sent, so verification is the only thing that can
+    // notice the mismatch — which is exactly why --verify exists.
+    set_code(&d.st, "GT2").await;
+    let t = target(&d, "GT2");
+    let err = client::push(&t, me, &[local.display().to_string()], "", Plan { parallel: 3, resume: true, verify: true })
+        .await
+        .unwrap_err();
+    assert!(err.contains("checksum"), "{err}");
+    assert!(!root.join("gap.bin").exists(), "a rejected upload must not land");
+}
+
+/// A parallel push opens its ranges concurrently, so a higher range can fill the part
+/// file past a lower range's start before that range connects. The part file's length
+/// is not a prefix: the lower range still has to send its own bytes.
+#[tokio::test]
+async fn a_late_range_never_skips_bytes_written_by_a_higher_one() {
+    let _g = env_lock();
+    let home = home("late-range");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "LR", |c| c.code_one_shot = false).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    const M8: u64 = 8 * 1024 * 1024;
+    let size = 3 * M8;
+
+    // the *last* range goes first and grows the part file to 24 MB
+    let mut high = raw(&d.addr, Cred::Code { code: "LR".into(), password: None }, &me).await;
+    let begin = Msg::PutBegin { path: "p.bin".into(), size, offset: 2 * M8, len: M8, truncate: false };
+    proto::write_msg(&mut high, &begin).await.unwrap();
+    assert_eq!(expect_resume(&mut high).await.0, 2 * M8);
+    send_bulk(&mut high, &vec![1u8; M8 as usize]).await;
+
+    // the first range must start at 0, not at the length the peer already holds
+    let mut low = raw(&d.addr, Cred::Code { code: "LR".into(), password: None }, &me).await;
+    let begin = Msg::PutBegin { path: "p.bin".into(), size, offset: 0, len: M8, truncate: false };
+    proto::write_msg(&mut low, &begin).await.unwrap();
+    let (start, _) = expect_resume(&mut low).await;
+    assert_eq!(start, 0, "range 0 skipped bytes that the last range had written");
+}
+
+// -------------------------------------------------- structured errors (G6)
+
+#[tokio::test]
+async fn failures_carry_a_machine_readable_kind() {
+    let _g = env_lock();
+    let home = home("errkind");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "EK", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    std::fs::create_dir_all(root.join("adir")).unwrap();
+    std::fs::write(root.join("tiny.bin"), b"abcd").unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "EK".into(), password: None }, &me).await;
+
+    // a part file that is too short for the declared size
+    let begin = Msg::PutBegin { path: "tiny.bin".into(), size: 4, offset: 0, len: 4, truncate: false };
+    proto::write_msg(&mut s, &begin).await.unwrap();
+    expect_resume(&mut s).await;
+    proto::send_data(&mut s, b"abcd").await.unwrap();
+    proto::send_data(&mut s, &[]).await.unwrap();
+    expect_ok(&mut s).await;
+
+    let cases: Vec<(Msg, &str)> = vec![
+        (Msg::List { path: "../escape".into() }, "path"),
+        (Msg::List { path: "missing".into() }, "notfound"),
+        (Msg::GetBegin { path: "adir".into(), offset: 0, len: 4 }, "isdir"),
+        (Msg::Del { path: "adir".into() }, "isdir"),
+        (
+            Msg::PutBegin { path: "x.bin".into(), size: 4, offset: u64::MAX, len: 4, truncate: false },
+            "range",
+        ),
+        (Msg::PutEnd { path: "tiny.bin".into(), size: 99, mtime: 0, sha256: None }, "incomplete"),
+    ];
+    for (frame, want) in cases {
+        let label = format!("{frame:?}");
+        proto::write_msg(&mut s, &frame).await.unwrap();
+        let (code, msg) = expect_err_coded(&mut s).await;
+        assert_eq!(code, want, "{label} gave {code}: {msg}");
+        assert!(!msg.is_empty(), "{label} lost its message");
+    }
+}
+
+// --------------------------------------------------------------- rest api
+
