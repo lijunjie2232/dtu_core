@@ -2148,3 +2148,202 @@ async fn stopping_the_core_drains_live_connections() {
     assert!(took < Duration::from_secs(5), "drain overran: {took:?}");
 }
 
+#[tokio::test]
+async fn an_invitation_can_be_abandoned_by_the_caller() {
+    let _g = env_lock();
+    let home = home("invite-wait");
+    let b = daemon(&home, &home.join("b"), "unused", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    let pending = tokio::time::timeout(
+        Duration::from_millis(300),
+        client::invite_send(&b.addr, identity::now() + 600, None, &me, &mut Store::default(), 47000, |_, _| {}),
+    )
+    .await;
+    assert!(pending.is_err(), "the caller should be able to stop waiting");
+
+    // the peer keeps the invitation queued, and it can still be answered
+    let queued = crate::invite::list(&b.st).await;
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    let _ = crate::invite::decide(&b.st, &queued[0].id, Decision::Deny).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(crate::invite::list(&b.st).await.is_empty());
+}
+
+// ------------------------------------------------------ on-the-wire harness
+
+/// A recording TCP relay. Windows does not let you sniff loopback, so the only way
+/// to see what really crosses the wire on one machine is to be an on-path proxy.
+/// It also doubles as a tamper harness: mutating bytes here is exactly what an
+/// active attacker would do.
+struct Relay {
+    addr: String,
+    wire: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Relay {
+    async fn start(upstream: &str) -> Relay {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let up = upstream.to_string();
+        let sink = wire.clone();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let up = up.clone();
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let Ok(server) = TcpStream::connect(&up).await else {
+                        return;
+                    };
+                    let (mut cr, mut cw) = client.into_split();
+                    let (mut sr, mut sw) = server.into_split();
+                    let a = tokio::spawn({
+                        let sink = sink.clone();
+                        async move { pump(&mut cr, &mut sw, &sink).await }
+                    });
+                    let b = tokio::spawn(async move { pump(&mut sr, &mut cw, &sink).await });
+                    let _ = tokio::join!(a, b);
+                });
+            }
+        });
+        Relay { addr: format!("127.0.0.1:{port}"), wire }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.wire.lock().unwrap()).to_string()
+    }
+}
+
+async fn pump<R, W>(r: &mut R, w: &mut W, sink: &Arc<Mutex<Vec<u8>>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut chunk = vec![0u8; 32 * 1024];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                sink.lock().unwrap().extend_from_slice(&chunk[..n]);
+                if w.write_all(&chunk[..n]).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_relay_harness_sees_both_directions() {
+    // self-check: an echo target must show up twice in the capture
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = format!("127.0.0.1:{}", echo.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let (mut s, _) = echo.accept().await.unwrap();
+        let mut buf = [0u8; 64];
+        while let Ok(n) = s.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let _ = s.write_all(&buf[..n]).await;
+        }
+    });
+
+    let relay = Relay::start(&target).await;
+    let mut c = TcpStream::connect(&relay.addr).await.unwrap();
+    c.write_all(b"ping-marker").await.unwrap();
+    let mut back = [0u8; 11];
+    c.read_exact(&mut back).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let wire = relay.text();
+    assert!(wire.contains("ping-marker"), "relay captured nothing: {wire:?}");
+    assert_eq!(wire.matches("ping-marker").count(), 2, "both directions should be teed: {wire:?}");
+}
+
+/// C1 gate: once the transport is encrypted, neither the pairing code nor file
+/// contents may be readable by an on-path observer. Enable with
+/// `cargo test -- --ignored` after transport encryption lands.
+#[ignore = "C1: expected to fail while the transport is plaintext"]
+#[tokio::test]
+async fn an_on_path_observer_cannot_read_the_wire() {
+    let _g = env_lock();
+    let home = home("wire");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "WIRECODE", |_| {}).await;
+    let relay = Relay::start(&d.addr).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+
+    let marker = "SECRET-MARKER-9182";
+    std::fs::write(work.join("secret.txt"), marker.as_bytes()).unwrap();
+    let t = Target::new(
+        relay.addr.clone(),
+        Cred::Code { code: "WIRECODE".into(), password: None },
+        None,
+    );
+    client::push(
+        &t,
+        me,
+        &[work.join("secret.txt").display().to_string()],
+        "",
+        Plan { parallel: 1, resume: true, verify: false },
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(root.join("secret.txt")).unwrap(), marker.as_bytes());
+
+    let wire = relay.text();
+    assert!(wire.len() > 1024, "the relay should have seen real traffic: {} bytes", wire.len());
+    assert!(!wire.contains("WIRECODE"), "the pairing code crossed the wire in the clear");
+    assert!(!wire.contains(marker), "file contents crossed the wire in the clear");
+}
+
+// -------------------------------------------------- gap resume (B4)
+
+#[tokio::test]
+async fn the_peer_records_completed_ranges() {
+    let _g = env_lock();
+    let home = home("gapmap");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "GM", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "GM".into(), password: None }, &me).await;
+
+    // three ranges of 4 bytes; write the first and the last, leave the middle empty
+    for (range, body) in [((0u64, 4u64), b"aaaa"), ((8, 12), b"cccc")] {
+        let begin = Msg::PutBegin { path: "gap.bin".into(), size: 12, offset: range.0, len: 4, truncate: false };
+        proto::write_msg(&mut s, &begin).await.unwrap();
+        assert_eq!(expect_resume(&mut s).await.0, range.0, "a gap must not be skipped");
+        proto::send_data(&mut s, body).await.unwrap();
+        proto::send_data(&mut s, &[]).await.unwrap();
+        expect_ok(&mut s).await;
+    }
+
+    proto::write_msg(&mut s, &Msg::Map { path: "gap.bin".into() }).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Ranges { done, size } => {
+            assert_eq!(size, 12, "the part file spans the highest written byte");
+            assert_eq!(done, vec![(0, 4), (8, 12)], "only real ranges are recorded");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // landing the file clears the record
+    set_code(&d.st, "GM2").await;
+    let mut s = raw(&d.addr, Cred::Code { code: "GM2".into(), password: None }, &me).await;
+    let end = Msg::PutEnd { path: "gap.bin".into(), size: 12, mtime: 0, sha256: None };
+    proto::write_msg(&mut s, &end).await.unwrap();
+    expect_ok(&mut s).await;
+    proto::write_msg(&mut s, &Msg::Map { path: "gap.bin".into() }).await.unwrap();
+    match proto::read_msg(&mut s).await.unwrap() {
+        Msg::Ranges { done, size } => {
+            assert!(done.is_empty(), "landing must forget the ranges: {done:?}");
+            assert_eq!(size, 0, "the staging file is gone");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
