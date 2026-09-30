@@ -1964,3 +1964,187 @@ async fn list_chunk_boundary_is_exact() {
     assert_eq!(all.len(), 1001);
 }
 
+#[tokio::test]
+async fn a_corrupt_trust_file_does_not_wipe_access() {
+    let _g = env_lock();
+    let home = home("badtrust");
+    let d = daemon(&home, &home.join("root"), "unused", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    let now = identity::now();
+    let token = jwt::sign(&d.st.id, &me.id, now + 3600);
+    {
+        let mut trust = d.st.trust.lock().await;
+        trust.insert(&me.id, &me.pubkey(), &token.clone(), now + 3600, None);
+        trust.save().unwrap();
+    }
+    drop(raw(&d.addr, Cred::Token { token: token.clone() }, &me).await);
+
+    // a half-written file must be ignored, not treated as "everything revoked"
+    std::fs::write(crate::cfg::file("trust.json"), b"{ truncated").unwrap();
+    drop(raw(&d.addr, Cred::Token { token }, &me).await);
+}
+
+// ---------------------------------------------- peripheral: dry run, delete
+
+#[tokio::test]
+async fn dry_run_reports_without_touching_the_peer() {
+    let _g = env_lock();
+    let home = home("dryplan");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "DP", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "DP");
+
+    std::fs::write(work.join("a.txt"), b"0123456789").unwrap();
+    std::fs::write(work.join("b.txt"), b"bb").unwrap();
+    let locals = vec![work.join("a.txt").display().to_string(), work.join("b.txt").display().to_string()];
+
+    // nothing exists yet: the plan says so, and nothing is created
+    let rows = client::plan_push(&t, me.clone(), &locals, "plan").await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.remote_size == 0 && !r.up_to_date()));
+    assert!(!root.join("plan").exists(), "a dry run must not create directories");
+
+    // transfer for real, then the plan reports it as up to date
+    client::push(&t, me.clone(), &locals, "plan", Plan { parallel: 2, resume: true, verify: false })
+        .await
+        .unwrap();
+    let rows = client::plan_push(&t, me.clone(), &locals, "plan").await.unwrap();
+    assert!(rows.iter().all(|r| r.up_to_date()), "{rows:?}");
+    assert_eq!(rows[0].remote, "plan/a.txt");
+
+    // stat is read-only for a missing path too
+    assert_eq!(client::stat(&t, &me, "plan/absent.bin").await.unwrap(), 0);
+    assert!(!root.join("plan/absent.bin").exists());
+}
+
+#[tokio::test]
+async fn sync_creates_a_missing_remote_directory() {
+    let _g = env_lock();
+    let home = home("fresh-remote");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(work.join("deep")).unwrap();
+    let d = daemon(&home, &root, "FR", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "FR");
+    let plan = Plan { parallel: 2, resume: true, verify: false };
+
+    std::fs::write(work.join("one.txt"), b"1").unwrap();
+    std::fs::write(work.join("deep/two.txt"), b"2").unwrap();
+
+    // the destination does not exist at all
+    let rows = client::diff(&t, &me, &work.display().to_string(), "fresh/dir").await.unwrap();
+    assert_eq!(rows.len(), 3, "two files plus the deep directory: {rows:?}");
+    assert!(rows.iter().any(|r| r.dir && r.rel == "deep"), "{rows:?}");
+    let log = client::sync(&t, me.clone(), &work.display().to_string(), "fresh/dir", client::SyncOpts { prefer: Prefer::Newer, dry_run: false, delete: client::DeleteSide::None }, plan)
+        .await
+        .unwrap();
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert_eq!(std::fs::read(root.join("fresh/dir/deep/two.txt")).unwrap(), b"2");
+}
+
+#[tokio::test]
+async fn delete_mirrors_either_side() {
+    let _g = env_lock();
+    let home = home("delete");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "DL", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let t = target(&d, "DL");
+    let plan = Plan { parallel: 2, resume: true, verify: false };
+
+    std::fs::write(work.join("keep.txt"), b"keep").unwrap();
+    client::push(&t, me.clone(), &[work.join("keep.txt").display().to_string()], "s", plan)
+        .await
+        .unwrap();
+
+    // `--delete remote` removes what only the peer has
+    std::fs::write(root.join("s/theirs.txt"), b"peer only").unwrap();
+    let log = client::sync(&t, me.clone(), &work.display().to_string(), "s", client::SyncOpts { prefer: Prefer::Newer, dry_run: false, delete: client::DeleteSide::Remote }, plan)
+        .await
+        .unwrap();
+    assert!(log.iter().any(|l| l.starts_with("del(remote)")), "{log:?}");
+    assert!(!root.join("s/theirs.txt").exists(), "peer-only file should be removed");
+    assert_eq!(std::fs::read(work.join("theirs.txt")).unwrap(), b"peer only", "it must be pulled first");
+
+    // `--delete local` removes what only this side has
+    std::fs::write(work.join("mine.txt"), b"local only").unwrap();
+    let log = client::sync(&t, me.clone(), &work.display().to_string(), "s", client::SyncOpts { prefer: Prefer::Newer, dry_run: false, delete: client::DeleteSide::Local }, plan)
+        .await
+        .unwrap();
+    assert!(log.iter().any(|l| l.contains("del(remote side wins)")), "{log:?}");
+    assert!(!work.join("mine.txt").exists(), "local-only file should be removed");
+    assert_eq!(std::fs::read(root.join("s/mine.txt")).unwrap(), b"local only", "it must be pushed first");
+
+    // dry runs never delete
+    std::fs::write(work.join("spare.txt"), b"x").unwrap();
+    client::sync(&t, me.clone(), &work.display().to_string(), "s", client::SyncOpts { prefer: Prefer::Newer, dry_run: true, delete: client::DeleteSide::Local }, plan)
+        .await
+        .unwrap();
+    assert!(work.join("spare.txt").exists(), "dry run deleted a file");
+}
+
+#[tokio::test]
+async fn remote_delete_is_guarded() {
+    let _g = env_lock();
+    let home = home("delguard");
+    let root = home.join("root");
+    let d = daemon(&home, &root, "DG", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+    std::fs::create_dir_all(root.join("dir")).unwrap();
+    std::fs::write(root.join("dir/inside.txt"), b"x").unwrap();
+    std::fs::write(root.join("gone.txt"), b"x").unwrap();
+    let mut s = raw(&d.addr, Cred::Code { code: "DG".into(), password: None }, &me).await;
+
+    // a directory is not deleted
+    proto::write_msg(&mut s, &Msg::Del { path: "dir".into() }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("directory"));
+    assert!(root.join("dir/inside.txt").exists());
+
+    // traversal is refused
+    proto::write_msg(&mut s, &Msg::Del { path: "../escape.txt".into() }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("path"));
+
+    // a missing file reports a stat failure
+    proto::write_msg(&mut s, &Msg::Del { path: "nope.txt".into() }).await.unwrap();
+    assert!(expect_err(&mut s).await.contains("stat"));
+
+    // the happy path, then listing no longer shows it
+    proto::write_msg(&mut s, &Msg::Del { path: "gone.txt".into() }).await.unwrap();
+    expect_ok(&mut s).await;
+    assert!(!root.join("gone.txt").exists());
+}
+
+#[tokio::test]
+async fn stopping_the_core_drains_live_connections() {
+    let _g = env_lock();
+    let home = home("drain");
+    let root = home.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = Config {
+        port: free_port(),
+        root: root.to_string_lossy().into_owned(),
+        drain_timeout: 1,
+        ..Default::default()
+    };
+    crate::cfg::write_json(&crate::cfg::file("config.json"), &cfg).unwrap();
+    let daemon = crate::embed::host(cfg.clone()).expect("host the core");
+    daemon.wait_ready().expect("services must come up");
+
+    // a connection that never finishes must not be cut mid-flight
+    let held = TcpStream::connect(format!("127.0.0.1:{}", cfg.port)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = std::time::Instant::now();
+    daemon.stop();
+    let took = started.elapsed();
+    drop(held);
+    assert!(took >= Duration::from_millis(800), "drain budget was not honoured: {took:?}");
+    assert!(took < Duration::from_secs(5), "drain overran: {took:?}");
+}
+
