@@ -2502,3 +2502,102 @@ async fn failures_carry_a_machine_readable_kind() {
 
 // --------------------------------------------------------------- rest api
 
+/// Minimal HTTP client for the loopback REST surface: returns (status line, body).
+async fn http_get(addr: &str, path: &str) -> (String, String) {
+    http_with(addr, &format!("GET {path} HTTP/1.1\r\n")).await
+}
+
+async fn http_bearer(addr: &str, path: &str, token: &str) -> (String, String) {
+    http_with(addr, &format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\n")).await
+}
+
+async fn http_with(addr: &str, first: &str) -> (String, String) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let req = format!("{first}Host: localhost\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).to_string();
+    match text.split_once("\r\n\r\n") {
+        Some((head, body)) => (head.lines().next().unwrap_or_default().to_string(), body.to_string()),
+        None => (text, String::new()),
+    }
+}
+
+#[tokio::test]
+async fn the_rest_api_needs_the_key_and_serves_the_live_state() {
+    let _g = env_lock();
+    let home = home("restapi");
+    let root = home.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let d = daemon(&home, &root, "UI", |c| c.api_port = free_port()).await;
+    let addr = format!("127.0.0.1:{}", crate::api::api_port(&d.st));
+    tokio::spawn(crate::api::serve(d.st.clone(), "webtok".into()));
+    for _ in 0..40 {
+        if TcpStream::connect(&addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // no key, wrong key: both refused before touching state
+    let (status, _) = http_get(&addr, "/api/status").await;
+    assert!(status.contains("403"), "{status}");
+    let (status, body) = http_get(&addr, "/api/status?t=guess").await;
+    assert!(status.contains("403") && !body.contains(&d.st.id.id), "{status} {body}");
+
+    // the key opens it, from the query string or the header
+    let (_, body) = http_get(&addr, "/api/status?t=webtok").await;
+    assert!(body.contains(&d.st.id.id), "{body}");
+    assert!(body.contains("\"proto\":"), "{body}");
+    let (status, body) = http_bearer(&addr, "/api/status", "webtok").await;
+    assert!(status.contains("200") && body.contains(&d.st.id.id), "{status} {body}");
+
+    let (_, body) = http_get(&addr, "/api/code?t=webtok").await;
+    let before = d.st.code.lock().await.code.clone();
+    assert!(body.contains(&before), "{body}");
+
+    let (_, body) = http_get(&addr, "/api/devices?t=webtok").await;
+    assert!(body.contains("\"items\""), "{body}");
+    let (_, body) = http_get(&addr, "/api/invites?t=webtok").await;
+    assert_eq!(body.trim(), "{\"items\":[]}", "{body}");
+
+    // no page is served: a frontend of your own is expected
+    let (status, _) = http_get(&addr, "/?t=webtok").await;
+    assert!(status.contains("404"), "{status}");
+    // an unknown endpoint is a clean 404, not a panic
+    let (status, _) = http_get(&addr, "/api/nope?t=webtok").await;
+    assert!(status.contains("404"), "{status}");
+}
+
+
+// ------------------------------------------------------------- config
+
+#[tokio::test]
+async fn config_handles_corruption_and_durations() {
+    let _g = env_lock();
+    let home = home("cfg");
+    std::fs::write(home.join("config.json"), b"{ not json").unwrap();
+    let cfg = Config::load();
+    assert!(cfg.port > 0);
+    assert!(cfg.root.contains("share"), "{}", cfg.root);
+
+    let now = identity::now();
+    assert_eq!(crate::cfg::parse_expiry("never").unwrap(), 0);
+    assert!(crate::cfg::parse_expiry("1w").unwrap() >= now + 7 * 86400);
+    assert!(crate::cfg::parse_expiry("15m").unwrap() >= now + 900);
+    assert_eq!(crate::cfg::parse_expiry("").unwrap(), 0);
+    assert!(crate::cfg::parse_expiry("5y").is_err());
+
+    // guard: empty remote path means "the root itself"
+    let root = home.join("share");
+    std::fs::create_dir_all(&root).unwrap();
+    assert_eq!(guard::resolve(&root, "").unwrap(), root);
+}
+
+
+
+
+
+
+
