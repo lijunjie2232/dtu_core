@@ -1,0 +1,27 @@
+site_name: dtu_core
+site_description: LAN 内のマシン間で認証付きファイル転送を行うコアライブラリ
+docs_dir: docs
+site_dir: site
+
+# GitHub Pages の絶対 URL。CI がリポジトリから自動で埋める（ローカルでは localhost）。
+site_url: !ENV [SITE_URL, "http://127.0.0.1:8000/"]
+
+theme:
+  name: material
+  language: ja
+  features:
+    - navigation.top
+    - search.suggest
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: ダークモード
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: ライトモード
+
