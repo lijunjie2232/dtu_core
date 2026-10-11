@@ -25,3 +25,35 @@ theme:
         icon: material/weather-sunny
         name: ライトモード
 
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: true
+      reconfigure_material: true
+      languages:
+        - locale: ja
+          default: true
+          name: 日本語
+        - locale: en
+          name: English
+          nav_translations:
+            ホーム: Home
+        - locale: zh-TW
+          name: 繁體中文
+          nav_translations:
+            ホーム: 首頁
+
+nav:
+  - ホーム: index.md
+  - REST API: api.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - attr_list
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
