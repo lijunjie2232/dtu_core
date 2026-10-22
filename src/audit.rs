@@ -1,4 +1,5 @@
-//! Auth audit log (JSONL). Transfers are not logged, only auth decisions.
+//! Audit log (JSONL): who authenticated, and which files moved over that connection.
+//! Contents are never logged — only the path, the size and the peer (id + address).
 
 use serde::Serialize;
 use std::io::Write;
@@ -7,15 +8,23 @@ use std::io::Write;
 struct Line<'a> {
     ts: String,
     epoch: u64,
+    /// auth | invite | file | diag
     event: &'a str,
+    /// ok | deny | pending | timeout | error
     result: &'a str,
+    /// how the connection authenticated (jwt/code/session/unlimit), or the file
+    /// operation (put/get/del) for `event = file`
     method: &'a str,
     device: Option<&'a str>,
     addr: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
     reason: Option<&'a str>,
 }
 
-/// Keep two generations; an always-on daemon must not grow one file forever.
+/// Keep two generations; an always-on app must not grow one file forever.
 const MAX_BYTES: u64 = 1 << 20;
 
 pub fn log(
@@ -26,8 +35,49 @@ pub fn log(
     addr: &str,
     reason: Option<&str>,
 ) {
+    write(Line {
+        ts: String::new(),
+        epoch: 0,
+        event,
+        result,
+        method,
+        device,
+        addr,
+        path: None,
+        bytes: None,
+        reason,
+    });
+}
+
+/// One transferred file (or one downloaded range) with the peer that moved it.
+/// `op` is `put`, `get` or `del`.
+pub fn file(
+    op: &str,
+    result: &str,
+    device: &str,
+    addr: &str,
+    path: &str,
+    bytes: u64,
+    reason: Option<&str>,
+) {
+    write(Line {
+        ts: String::new(),
+        epoch: 0,
+        event: "file",
+        result,
+        method: op,
+        device: Some(device),
+        addr,
+        path: Some(path),
+        bytes: Some(bytes),
+        reason,
+    });
+}
+
+fn write(mut line: Line<'_>) {
     let epoch = crate::identity::now();
-    let line = Line { ts: iso(epoch), epoch, event, result, method, device, addr, reason };
+    line.ts = iso(epoch);
+    line.epoch = epoch;
     let path = crate::cfg::file("auth.log");
     if let Some(d) = path.parent() {
         let _ = std::fs::create_dir_all(d);
