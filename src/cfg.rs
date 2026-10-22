@@ -166,17 +166,28 @@ impl Config {
                 value.parse::<u64>().map_err(|_| format!("{key} expects a number"))?,
             ),
             serde_json::Value::Bool(_) => serde_json::Value::from(parse_bool(value)?),
-            _ => {
-                if value.is_empty() || value == "none" {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::from(value)
-                }
+            // An optional text field (e.g. `code_password`) is cleared by "" or "none";
+            // required text keeps whatever it is given.
+            _ if field(key).is_some_and(|f| f.kind == Kind::OptionalText)
+                && (value.is_empty() || value == "none") =>
+            {
+                serde_json::Value::Null
             }
+            _ => serde_json::Value::from(value),
         };
         *self = serde_json::from_value(v).map_err(|e| e.to_string())?;
         Ok(())
     }
+}
+
+/// The metadata of one setting, if the key exists.
+pub fn field(key: &str) -> Option<&'static Field> {
+    fields().iter().find(|f| f.key == key)
+}
+
+/// `true` when the running app can adopt a change without a restart.
+pub fn applies_live(key: &str) -> bool {
+    field(key).is_some_and(|f| !f.restart)
 }
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -248,5 +259,25 @@ mod tests {
         assert!(c.set("port", "abc").is_err());
         assert!(c.set("nope", "1").is_err());
     }
+
+    /// The settings form is driven by `fields()`; a new key without metadata (or a
+    /// metadata entry for a key that no longer exists) would silently disappear.
+    #[test]
+    fn every_key_has_a_form_field_and_round_trips() {
+        let json = serde_json::to_value(Config::default()).unwrap();
+        let keys: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        for key in &keys {
+            let f = crate::cfg::field(key).unwrap_or_else(|| panic!("no settings metadata for {key}"));
+            assert!(Config::default().get(f.key).is_some(), "{key} is not readable");
+            // the default always parses back into the same value
+            let mut c = Config::default();
+            let v = c.get(key).unwrap();
+            c.set(key, &v).unwrap_or_else(|e| panic!("set {key}={v}: {e}"));
+        }
+        for f in crate::cfg::fields() {
+            assert!(keys.iter().any(|k| k == f.key), "field {} is not in Config", f.key);
+        }
+    }
 }
+
 
