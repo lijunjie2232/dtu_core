@@ -104,6 +104,12 @@ impl State {
         }
     }
 
+    /// Adopt the settings a running app can take without a restart; everything else
+    /// is read from `config.json` at startup.
+    pub async fn apply_live(&self, cfg: &Config) {
+        self.code.lock().await.password = cfg.code_password.clone();
+    }
+
     pub async fn drop_invite(&self, id: &str) {
         let mut q = self.invites.lock().await;
         q.retain(|p| p.id != id);
