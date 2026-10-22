@@ -53,6 +53,58 @@ pub struct Config {
     pub drain_timeout: u64,
     /// Loopback port for the REST surface. 0 = port + 1.
     pub api_port: u16,
+    /// How often a UI repaints itself, in seconds. 0 = the client's default.
+    pub ui_refresh_secs: u64,
+    /// How many log lines a UI keeps on screen. 0 = the client's default.
+    pub ui_log_lines: usize,
+    /// Close the main window to the tray instead of quitting.
+    pub ui_close_to_tray: bool,
+}
+
+/// How a settings field is edited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Number,
+    Bool,
+    Text,
+    /// Text that can be unset: an empty value clears it.
+    #[serde(rename = "optional_text")]
+    OptionalText,
+}
+
+/// One editable setting, so every frontend can render the same form.
+#[derive(Debug, Clone, Serialize)]
+pub struct Field {
+    pub key: &'static str,
+    pub kind: Kind,
+    /// `true` when the running app cannot adopt the change (it reads the value
+    /// once at startup).
+    pub restart: bool,
+    pub help: &'static str,
+}
+
+/// Every key of `Config`, in the order a settings form shows them.
+pub fn fields() -> &'static [Field] {
+    &[
+        Field { key: "port", kind: Kind::Number, restart: true, help: "LAN port for transfers and discovery" },
+        Field { key: "api_port", kind: Kind::Number, restart: true, help: "Loopback REST port (0 = port + 1)" },
+        Field { key: "root", kind: Kind::Text, restart: true, help: "Directory served to peers" },
+        Field { key: "parallel", kind: Kind::Number, restart: false, help: "Parallel TCP streams per file" },
+        Field { key: "unlimit", kind: Kind::Bool, restart: true, help: "DANGEROUS: accept any device, skip trust" },
+        Field { key: "unlimit_store_trust", kind: Kind::Bool, restart: true, help: "In unlimit mode, still record devices" },
+        Field { key: "code_one_shot", kind: Kind::Bool, restart: true, help: "The pairing code is consumed by the first auth" },
+        Field { key: "code_rotate_on_connect", kind: Kind::Bool, restart: true, help: "Rotate the pairing code on every connection" },
+        Field { key: "code_password", kind: Kind::OptionalText, restart: false, help: "Extra password on top of the code (empty clears)" },
+        Field { key: "invite_timeout", kind: Kind::Number, restart: true, help: "Seconds an invitation waits for a human" },
+        Field { key: "session_ttl", kind: Kind::Number, restart: true, help: "Seconds a session token stays valid" },
+        Field { key: "idle_timeout", kind: Kind::Number, restart: true, help: "Silent seconds before a connection is dropped (0 = off)" },
+        Field { key: "max_conn_per_ip", kind: Kind::Number, restart: true, help: "Concurrent connections per source address" },
+        Field { key: "drain_timeout", kind: Kind::Number, restart: true, help: "Seconds a stop waits for in-flight transfers" },
+        Field { key: "ui_refresh_secs", kind: Kind::Number, restart: true, help: "UI refresh interval in seconds (0 = client default)" },
+        Field { key: "ui_log_lines", kind: Kind::Number, restart: true, help: "Log lines a UI keeps (0 = client default)" },
+        Field { key: "ui_close_to_tray", kind: Kind::Bool, restart: false, help: "Closing the window hides it to the tray instead of quitting" },
+    ]
 }
 
 impl Default for Config {
@@ -72,6 +124,9 @@ impl Default for Config {
             max_conn_per_ip: 32,
             drain_timeout: 5,
             api_port: 0,
+            ui_refresh_secs: 0,
+            ui_log_lines: 0,
+            ui_close_to_tray: true,
         }
     }
 }
