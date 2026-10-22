@@ -250,6 +250,13 @@ async fn handle(mut s: TcpStream, peer: SocketAddr, st: Arc<State>) -> Result<()
             let _ = proto::write_msg(&mut s, &reply).await;
             return Ok(());
         }
+        // The inviter has to bring a name too: it ends up in the trust store.
+        if let Err(reason) = check_identity(&st, &from, &pubkey, &Cred::Any).await {
+            crate::audit::log("invite", "deny", "identity", Some(&from), &addr, Some(&reason));
+            let reply = Msg::Err { code: "identity".into(), msg: reason };
+            let _ = proto::write_msg(&mut s, &reply).await;
+            return Ok(());
+        }
         let inv = invite::Invite {
             from,
             pubkey,
@@ -273,6 +280,14 @@ async fn handle(mut s: TcpStream, peer: SocketAddr, st: Arc<State>) -> Result<()
         return Ok(());
     }
     let method = cred_method(&cred);
+
+    // A one-time code still has to bring a name: the log lines for this peer carry
+    // its device id next to its address, so an anonymous connection is refused.
+    if let Err(reason) = check_identity(&st, &id, &pubkey, &cred).await {
+        crate::audit::log("auth", "deny", method, Some(&id), &addr, Some(&reason));
+        let _ = proto::write_msg(&mut s, &Msg::AuthFail { reason }).await;
+        return Ok(());
+    }
 
     if let Err(reason) = authenticate(&st, &id, &pubkey, &cred, ip).await {
         crate::audit::log("auth", "deny", method, Some(&id), &addr, Some(&reason));
@@ -327,6 +342,40 @@ fn cred_method(cred: &Cred) -> &'static str {
         Cred::Session { .. } => "session",
         Cred::Any => "unlimit",
     }
+}
+
+/// Who is acting, for the file log lines.
+struct Peer<'a> {
+    id: &'a str,
+    addr: &'a str,
+}
+
+/// A peer must present a plausible device id and keypair before anything is logged
+/// under its name. Codes are one-time, the identity behind them is not: without this,
+/// a random connection could write anonymous or impersonated lines into the log.
+async fn check_identity(st: &State, id: &str, pubkey: &str, cred: &Cred) -> Result<(), String> {
+    if !valid_device_id(id) {
+        return Err("malformed device id".into());
+    }
+    if identity::verifying_key_from(pubkey).is_err() {
+        return Err("malformed public key".into());
+    }
+    // A code is handed out to anyone who asks, so an id we already pinned with a
+    // different key is either a re-keyed device (remove it first) or an impersonator.
+    // The token path compares the pin itself, in `authenticate`.
+    if !matches!(cred, Cred::Token { .. }) {
+        if let Some(known) = trust_snapshot(st).await.get_raw(id) {
+            if known.pubkey != pubkey {
+                return Err(format!("device {id} is already trusted with another key — remove it first"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Device ids are 22 base64url characters (`identity::random_id`).
+fn valid_device_id(id: &str) -> bool {
+    id.len() == 22 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Watchdog for established connections: a peer that goes silent is dropped
