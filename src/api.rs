@@ -99,14 +99,19 @@ async fn route(st: &Arc<State>, method: &str, path: &str, query: &str) -> (u16, 
             "{\"error\":\"the client app owns its lifetime; shutdown is not a remote operation\"}".to_string(),
         ),
         ("GET", "/api/devices") => (200, json!({ "items": devices(st).await }).to_string()),
+        // `event` narrows it down: auth | file | invite | diag.
         ("GET", "/api/log") => {
             let n = param(query, "n").and_then(|v| v.parse().ok()).unwrap_or(20);
-            (200, json!({ "lines": crate::audit::tail(n) }).to_string())
+            let event = param(query, "event");
+            let lines = crate::audit::tail_of(event.as_deref(), n);
+            (200, json!({ "lines": lines }).to_string())
         }
         // Read from disk: a PUT lands in config.json, and reporting the running
         // daemon's snapshot instead would just show the value before the write.
         ("GET", "/api/config") => (200, serde_json::to_string(&crate::cfg::Config::load()).unwrap_or_default()),
-        ("PUT", "/api/config") => put_config(query).await,
+        // The settings form: every key with its editor kind and help text.
+        ("GET", "/api/config/fields") => (200, json!({ "fields": crate::cfg::fields() }).to_string()),
+        ("PUT", "/api/config") => put_config(st, query).await,
         ("POST", "/api/transfer") => start_job(st, query).await,
         _ if path.starts_with("/api/invites/") => invite_action(st, path, query).await,
         _ if path.starts_with("/api/devices/") => device_action(st, method, path, query).await,
