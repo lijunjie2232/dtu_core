@@ -1196,6 +1196,97 @@ async fn audit_log_rotates_and_keeps_the_newest_lines() {
 }
 
 #[tokio::test]
+async fn transfers_are_logged_with_the_peer_and_its_address() {
+    let _g = env_lock();
+    let home = home("file-log");
+    let root = home.join("root");
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let d = daemon(&home, &root, "LOG", |_| {}).await;
+    let me = Arc::new(Identity::load_or_create_at(&home.join("me.json")).unwrap());
+    let plan = Plan { parallel: 2, resume: true, verify: false };
+
+    std::fs::write(work.join("note.txt"), b"logged bytes").unwrap();
+    let t = target(&d, "LOG");
+    client::push(&t, me.clone(), &[work.join("note.txt").display().to_string()], "in", plan)
+        .await
+        .unwrap();
+
+    // pull logs one line per downloaded range
+    let back = home.join("back");
+    std::fs::create_dir_all(&back).unwrap();
+    client::pull(&t, me.clone(), &["in/note.txt".to_string()], &back.display().to_string(), plan)
+        .await
+        .unwrap();
+
+    let files = crate::audit::tail_of(Some("file"), 50);
+    assert!(!files.is_empty(), "no file lines logged");
+    let put = files
+        .iter()
+        .find(|l| l.contains("\"method\":\"put\""))
+        .unwrap_or_else(|| panic!("no put line: {files:?}"));
+    assert!(put.contains(&me.id), "put line must name the peer: {put}");
+    assert!(put.contains("127.0.0.1:"), "put line must keep the peer address: {put}");
+    assert!(put.contains("\"path\":\"in/note.txt\""), "{put}");
+    assert!(put.contains("\"bytes\":12"), "{put}");
+    assert!(put.contains("\"result\":\"ok\""), "{put}");
+
+    let get = files
+        .iter()
+        .find(|l| l.contains("\"method\":\"get\""))
+        .unwrap_or_else(|| panic!("no get line: {files:?}"));
+    assert!(get.contains(&me.id) && get.contains("in/note.txt"), "{get}");
+
+    // the auth that carried them is in the same log, keyed by the same peer
+    let auth = crate::audit::tail_of(Some("auth"), 50);
+    assert!(auth.iter().any(|l| l.contains(&me.id) && l.contains("127.0.0.1:")), "{auth:?}");
+}
+
+#[tokio::test]
+async fn a_code_peer_without_a_usable_identity_is_refused() {
+    let _g = env_lock();
+    let home = home("bad-id");
+    let d = daemon(&home, &home.join("root"), "ID", |_| {}).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // a random connection that claims a one-character id
+    let mut s = TcpStream::connect(&d.addr).await.unwrap();
+    let hello = Msg::Hello {
+        proto: proto::PROTO,
+        id: "x".into(),
+        pubkey: me.pubkey(),
+        cred: Cred::Code { code: "ID".into(), password: None },
+        nonce: 0,
+    };
+    proto::write_msg(&mut s, &hello).await.unwrap();
+    let reason = match proto::read_msg(&mut s).await.unwrap() {
+        Msg::AuthFail { reason } => reason,
+        other => panic!("expected AuthFail, got {other:?}"),
+    };
+    assert!(reason.contains("malformed device id"), "{reason}");
+
+    let denies = crate::audit::tail_of(Some("auth"), 10);
+    assert!(denies.iter().any(|l| l.contains("\"deny\"") && l.contains("\"device\":\"x\"")), "{denies:?}");
+}
+
+#[tokio::test]
+async fn a_trusted_id_cannot_be_claimed_with_another_key() {
+    let _g = env_lock();
+    let home = home("impersonate");
+    let d = daemon(&home, &home.join("root"), "IM", |c| c.code_one_shot = false).await;
+    let me = Identity::load_or_create_at(&home.join("me.json")).unwrap();
+
+    // the device vouches for `me` from another key, so claiming that id is impersonation
+    {
+        let mut trust = d.st.trust.lock().await;
+        let other = Identity::load_or_create_at(&home.join("other.json")).unwrap();
+        trust.insert(&me.id, &other.pubkey(), "token", 0, None);
+    }
+    let reason = raw_denied(&d.addr, Cred::Code { code: "IM".into(), password: None }, &me).await;
+    assert!(reason.contains("already trusted with another key"), "{reason}");
+}
+
+#[tokio::test]
 async fn paths_past_the_windows_limit_still_work() {
     let _g = env_lock();
     let home = home("long");
