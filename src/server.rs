@@ -308,6 +308,7 @@ async fn handle(mut s: TcpStream, peer: SocketAddr, st: Arc<State>) -> Result<()
     proto::write_msg(&mut s, &ok).await.map_err(|e| e.to_string())?;
 
     let idle = idle_of(&st);
+    let peer = Peer { id: &id, addr: &addr };
     loop {
         let msg = match next_msg(&mut s, idle, "op").await {
             Ok(m) => m,
@@ -318,14 +319,14 @@ async fn handle(mut s: TcpStream, peer: SocketAddr, st: Arc<State>) -> Result<()
                 put(&mut s, &st, &path, size, offset, len, truncate).await
             }
             Msg::PutEnd { path, size, mtime, sha256 } => {
-                put_end(&mut s, &st, &path, size, mtime, sha256).await
+                put_end(&mut s, &st, &path, size, mtime, sha256, &peer).await
             }
-            Msg::GetBegin { path, offset, len } => get(&mut s, &st, &path, offset, len).await,
+            Msg::GetBegin { path, offset, len } => get(&mut s, &st, &path, offset, len, &peer).await,
             Msg::List { path } => list(&mut s, &st, &path).await,
             Msg::Map { path } => map_ranges(&mut s, &st, &path).await,
             Msg::Mkdir { path } => mkdir(&mut s, &st, &path).await,
             Msg::Stat { path } => stat(&mut s, &st, &path).await,
-            Msg::Del { path } => del(&mut s, &st, &path).await,
+            Msg::Del { path } => del(&mut s, &st, &path, &peer).await,
             other => Err(format!("unexpected frame: {other:?}").into()),
         };
         if let Err(e) = res {
@@ -581,7 +582,25 @@ async fn put(
     proto::write_msg(s, &Msg::Ok).await.map_err(|e| OpError::io(e.to_string()))
 }
 
+/// Log every completed upload: one line per file, with the peer and its address.
 async fn put_end(
+    s: &mut TcpStream,
+    st: &State,
+    path: &str,
+    size: u64,
+    mtime: u64,
+    sha256: Option<String>,
+    peer: &Peer<'_>,
+) -> Result<(), OpError> {
+    let res = put_end_inner(s, st, path, size, mtime, sha256).await;
+    match &res {
+        Ok(()) => crate::audit::file("put", "ok", peer.id, peer.addr, path, size, None),
+        Err(e) => crate::audit::file("put", "error", peer.id, peer.addr, path, size, Some(&e.msg)),
+    }
+    res
+}
+
+async fn put_end_inner(
     s: &mut TcpStream,
     st: &State,
     path: &str,
@@ -634,7 +653,31 @@ async fn put_end(
     proto::write_msg(s, &Msg::Ok).await.map_err(|e| OpError::io(e.to_string()))
 }
 
-async fn get(s: &mut TcpStream, st: &State, path: &str, offset: u64, len: u64) -> Result<(), OpError> {
+/// Log every downloaded range: the client asks for one range per connection.
+async fn get(
+    s: &mut TcpStream,
+    st: &State,
+    path: &str,
+    offset: u64,
+    len: u64,
+    peer: &Peer<'_>,
+) -> Result<(), OpError> {
+    let res = get_inner(s, st, path, offset, len).await;
+    let sent = res.as_ref().copied().unwrap_or(0);
+    match &res {
+        Ok(bytes) => crate::audit::file("get", "ok", peer.id, peer.addr, path, *bytes, None),
+        Err(e) => crate::audit::file("get", "error", peer.id, peer.addr, path, sent, Some(&e.msg)),
+    }
+    res.map(|_| ())
+}
+
+async fn get_inner(
+    s: &mut TcpStream,
+    st: &State,
+    path: &str,
+    offset: u64,
+    len: u64,
+) -> Result<u64, OpError> {
     let target = guard::resolve(&st.root, path).map_err(OpError::path)?;
     let md = tokio::fs::metadata(&target).await.map_err(|e| format!("stat {}: {e}", target.display()))?;
     if md.is_dir() {
@@ -649,6 +692,7 @@ async fn get(s: &mut TcpStream, st: &State, path: &str, offset: u64, len: u64) -
     let mut f = tokio::fs::File::open(&target).await.map_err(|e| e.to_string())?;
     f.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| e.to_string())?;
     let mut remaining = end - start;
+    let sent = remaining;
     let mut buf = vec![0u8; BUF];
     while remaining > 0 {
         let take = remaining.min(buf.len() as u64) as usize;
@@ -659,7 +703,8 @@ async fn get(s: &mut TcpStream, st: &State, path: &str, offset: u64, len: u64) -
         proto::send_data(s, &buf[..n]).await.map_err(|e| e.to_string())?;
         remaining -= n as u64;
     }
-    proto::send_data(s, &[]).await.map_err(|e| OpError::io(e.to_string()))
+    proto::send_data(s, &[]).await.map_err(|e| OpError::io(e.to_string()))?;
+    Ok(sent)
 }
 
 async fn list(s: &mut TcpStream, st: &State, path: &str) -> Result<(), OpError> {
@@ -730,7 +775,22 @@ async fn stat(s: &mut TcpStream, st: &State, path: &str) -> Result<(), OpError> 
     proto::write_msg(s, &reply).await.map_err(|e| OpError::io(e.to_string()))
 }
 
-async fn del(s: &mut TcpStream, st: &State, path: &str) -> Result<(), OpError> {
+/// Log deletions too: the tree is data the peer changed, not only files it sent.
+async fn del(
+    s: &mut TcpStream,
+    st: &State,
+    path: &str,
+    peer: &Peer<'_>,
+) -> Result<(), OpError> {
+    let res = del_inner(s, st, path).await;
+    match &res {
+        Ok(()) => crate::audit::file("del", "ok", peer.id, peer.addr, path, 0, None),
+        Err(e) => crate::audit::file("del", "error", peer.id, peer.addr, path, 0, Some(&e.msg)),
+    }
+    res
+}
+
+async fn del_inner(s: &mut TcpStream, st: &State, path: &str) -> Result<(), OpError> {
     let target = guard::resolve(&st.root, path).map_err(OpError::path)?;
     if target == st.root {
         return Err(OpError::new("path", "refusing to delete the served root"));
