@@ -202,14 +202,25 @@ async fn invite_action(st: &Arc<State>, path: &str, query: &str) -> (u16, String
     }
 }
 
-async fn put_config(query: &str) -> (u16, String) {
+async fn put_config(st: &Arc<State>, query: &str) -> (u16, String) {
     let (Some(key), Some(value)) = (param(query, "key"), param(query, "value")) else {
         return (400, "{\"error\":\"key and value are required\"}".to_string());
     };
     let mut cfg = crate::cfg::Config::load();
     let out = cfg.set(&key, &value).and_then(|_| cfg.save().map_err(|e| format!("save config: {e}")));
     match out {
-        Ok(()) => (200, json!({ "ok": true, "note": "takes effect on the next daemon start" }).to_string()),
+        Ok(()) => {
+            // The running app adopts the keys that need no restart.
+            if crate::cfg::applies_live(&key) {
+                st.apply_live(&cfg).await;
+            }
+            let note = if crate::cfg::applies_live(&key) {
+                "applied"
+            } else {
+                "takes effect on the next daemon start"
+            };
+            (200, json!({ "ok": true, "note": note }).to_string())
+        }
         Err(e) => (400, json!({ "error": e }).to_string()),
     }
 }
