@@ -29,8 +29,9 @@
 | POST | `/api/code/refresh?password=` | コードを再生成（空文字でパスワード解除） |
 | GET | `/api/scan?wait=1500` | LAN を探索（既定 1500 ms） |
 | GET | `/api/config` | 保存されている設定 |
-| PUT | `/api/config?key=&value=` | 設定を 1 項目書き換える（次回起動で有効） |
-| GET | `/api/log?n=20` | 認証ログの末尾 |
+| GET | `/api/config/fields` | 設定フォームの定義（key・kind・restart・help） |
+| PUT | `/api/config?key=&value=` | 設定を 1 項目書き換える（`note` で即時反映か次回起動かを返す） |
+| GET | `/api/log?n=20&event=auth\|file\|invite\|diag` | 監査ログの末尾（`event` で絞り込み） |
 | POST | `/api/transfer?op=...` | 転送を開始（下記） |
 | GET | `/api/transfer/<id>` | 転送ジョブの状態 |
 
@@ -73,6 +74,38 @@ curl -s -H "Authorization: Bearer $KEY" \
 
 失敗時は 4xx と `{"error": "..."}`。パスは `%20` などをデコードして受け取りますが、
 `paths` はカンマ区切りなので、名前にカンマを含むファイルは CLI から送ってください。
+
+## 設定
+
+`GET /api/config/fields` が全キーの定義を返すので、フロントエンドはそれをそのままフォームにできます。
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:47001/api/config/fields
+# {"fields":[{"key":"port","kind":"number","restart":true,"help":"LAN port for transfers and discovery"},
+#            {"key":"code_password","kind":"optional_text","restart":false,...}]}
+```
+
+`PUT` の応答の `note` が `applied` なら実行中のアプリがその場で採用済み、
+`takes effect on the next daemon start` なら次回起動からです。
+
+## 監査ログ
+
+認証だけでなく、実際に動いたファイルも 1 行ずつ入ります。`event=file` で転送だけを取り出せます。
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" "http://127.0.0.1:47001/api/log?n=50&event=file"
+# {"lines":["{\"ts\":\"…\",\"event\":\"file\",\"result\":\"ok\",\"method\":\"put\",\
+#   \"device\":\"0tZr…\",\"addr\":\"192.168.1.24:54712\",\"path\":\"in/a.bin\",\"bytes\":24117248}"]}
+```
+
+| event | method | 意味 |
+| --- | --- | --- |
+| `auth` | jwt / code / session / unlimit | 接続の認証結果（拒否理由付き） |
+| `file` | put / get / del | 1 ファイルの受信、1 レンジの送信、削除 |
+| `invite` | invite | 招待の pending / ok / deny / timeout |
+| `diag` | - | パニックなど |
+
+`get` は 1 レンジ（接続）ごとに 1 行です。同じパスの行を合計すると 1 回の転送になります。
 
 ## 便利な使い方
 
