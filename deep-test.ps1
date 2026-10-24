@@ -104,6 +104,13 @@ Check $sent ("app A pushed 24 MiB in {0:N1}s" -f $dt)
 $landed = Wait-Until { (Get-FileHash "$hB\share\in\big.bin" -Algorithm SHA256 -EA SilentlyContinue).Hash -eq $hash } "hash" 30
 Check $landed "24 MiB arrived byte-identical on B"
 
+# the transfer itself is logged on the receiver, with the peer and its address
+$logB = curl.exe -s -H "Authorization: Bearer $tokB" "http://127.0.0.1:$($portB+1)/api/log?n=100&event=file" | ConvertFrom-Json
+$fileLines = $logB.lines -join ""
+Check ($fileLines -match $idA) "file log names the peer device id"
+Check ($fileLines -match "127\.0\.0\.1:") "file log keeps the peer address"
+Check ($fileLines -match '"method":"put"' -and $fileLines -match "in/big.bin") "file log names the transferred path"
+
 Send $appA "push peerb $work\hello.txt $work\sub --to in"
 Check (Wait-Until { Test-Path "$hB\share\in\sub\nested.txt" } "dir push" 30) "push file + directory"
 Check ((Get-Content "$hB\share\in\hello.txt" -Raw) -eq "hello v1") "pushed bytes landed on B"
@@ -159,6 +166,8 @@ Check ($code -eq "000") "B's REST surface closed with the app"
 $oneShot = Dtu $hB "status"
 Check ($oneShot -match "device\s+\S{20,}") "a one-shot dtu status hosts the core, prints, and exits"
 Check ($oneShot -match "port\s+$portB") "it used the stored config"
+$fileLog = Dtu $hB @("log", "-n", "50", "--event", "file")
+Check ($fileLog -match '"event":"file"' -and $fileLog -match "in/hello.txt") "CLI log --event file shows what B received"
 
 Send $appA "exit"
 $t0 = Get-Date
@@ -170,4 +179,5 @@ Check ($null -eq $leftover) "no dtu process survives the apps"
 
 Write-Host "`n==== passed $script:pass, failed $script:fail ===="
 if ($script:fail -gt 0) { exit 1 }
+
 
