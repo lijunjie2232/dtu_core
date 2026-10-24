@@ -32,6 +32,8 @@ $env:DTU_HOME = $hA; & $cli config set port $portA | Out-Null
 $env:DTU_HOME = $hB; & $cli config set port $portB | Out-Null
 Check ((Dtu $hA @("config", "get", "port")).Trim() -eq "$portA") "config get/set"
 Check ((Dtu $hA @("config", "path")).Trim() -eq $hA) "config path = DTU_HOME"
+$fields = Dtu $hA @("config", "fields")
+Check ($fields -match "ui_refresh_secs" -and $fields -match "ui_close_to_tray" -and $fields -match "code_password" -and $fields -match "next start") "config fields lists every key with its scope"
 Check ((Dtu $hA "version") -match "device") "version prints the device id"
 
 Write-Host "`n== 2. two standalone apps (no external daemon) =="
@@ -125,6 +127,10 @@ $code = curl.exe -s -H "Authorization: Bearer $tokA" "$api/api/code" | ConvertFr
 Check ($code.code.Length -eq 8) "REST shows the pairing code"
 $null = curl.exe -s -X PUT -H "Authorization: Bearer $tokA" "$api/api/config?key=parallel&value=6" | ConvertFrom-Json
 Check (((curl.exe -s -H "Authorization: Bearer $tokA" "$api/api/config" | ConvertFrom-Json).parallel) -eq 6) "REST config write/read"
+$schema = curl.exe -s -H "Authorization: Bearer $tokA" "$api/api/config/fields" | ConvertFrom-Json
+Check (($schema.fields | Where-Object { $_.key -eq "code_password" }).kind -eq "optional_text") "REST exposes the settings form (kinds included)"
+$live = curl.exe -s -X PUT -H "Authorization: Bearer $tokA" "$api/api/config?key=code_password&value=" | ConvertFrom-Json
+Check ($live.note -eq "applied") "a live setting is adopted without a restart"
 Check ((curl.exe -s -o NUL -w "%{http_code}" -X POST -H "Authorization: Bearer $tokA" "$api/api/shutdown") -eq "400") "REST refuses to kill the app's own services"
 $rawLog = curl.exe -s -H "Authorization: Bearer $tokB" "http://127.0.0.1:$($portB+1)/api/log?n=20"
 $log = $rawLog | ConvertFrom-Json
