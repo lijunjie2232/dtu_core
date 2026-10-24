@@ -29,8 +29,9 @@
 | POST | `/api/code/refresh?password=` | 重新產生（空字串代表清除密碼） |
 | GET | `/api/scan?wait=1500` | 掃描區網（預設 1500 ms） |
 | GET | `/api/config` | 已儲存的設定 |
-| PUT | `/api/config?key=&value=` | 改一個設定（下次啟動生效） |
-| GET | `/api/log?n=20` | 認證日誌尾端 |
+| GET | `/api/config/fields` | 設定表單定義（key、kind、restart、help） |
+| PUT | `/api/config?key=&value=` | 改一個設定（`note` 回報是否即時生效） |
+| GET | `/api/log?n=20&event=auth\|file\|invite\|diag` | 稽核日誌尾端（`event` 可篩選） |
 | POST | `/api/transfer?op=...` | 開始一次傳輸（見下） |
 | GET | `/api/transfer/<id>` | 查詢傳輸工作狀態 |
 
@@ -73,6 +74,38 @@ curl -s -H "Authorization: Bearer $KEY" \
 
 失敗為 4xx 加 `{"error": "..."}`。路徑會做 percent 解碼，但 `paths` 以逗號分隔，
 檔名含逗號時請改用 CLI 傳送。
+
+## 設定
+
+`GET /api/config/fields` 回傳每個鍵的定義，前端可直接拿它渲染表單。
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" http://127.0.0.1:47001/api/config/fields
+# {"fields":[{"key":"port","kind":"number","restart":true,"help":"LAN port for transfers and discovery"},
+#            {"key":"code_password","kind":"optional_text","restart":false,...}]}
+```
+
+PUT 回應的 `note` 為 `applied` 表示執行中的應用已立即採用；
+為 `takes effect on the next daemon start` 則要等下次啟動。
+
+## 稽核日誌
+
+不只認證：真正搬動過的檔案也會一行一筆。用 `event=file` 只看傳輸。
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" "http://127.0.0.1:47001/api/log?n=50&event=file"
+# {"lines":["{\"ts\":\"…\",\"event\":\"file\",\"result\":\"ok\",\"method\":\"put\",
+#   \"device\":\"0tZr…\",\"addr\":\"192.168.1.24:54712\",\"path\":\"in/a.bin\",\"bytes\":24117248}"]}
+```
+
+| event | method | 意義 |
+| --- | --- | --- |
+| `auth` | jwt / code / session / unlimit | 連線認證結果（被拒時附原因） |
+| `file` | put / get / del | 收到一個檔案、送出一段區間、或刪除 |
+| `invite` | invite | pending / ok / deny / timeout |
+| `diag` | - | panic 等致命錯誤 |
+
+`get` 是「每段區間（每條連線）一行」；把同一路徑的行加總，就是一次傳輸。
 
 ## 常用片段
 

@@ -45,7 +45,7 @@ daemon.stop(); // 先把進行中的傳輸 drain 完，再停止
 | `trust.json` | 已信任裝置、釘選公鑰、對端簽發的 JWT |
 | `config.json` | 埠、分享根目錄、平行數… |
 | `control.token` | REST 用的本機金鑰（第一次啟動產生，之後重用） |
-| `auth.log` | 認證結果（JSON Lines，不記錄傳輸內容） |
+| `auth.log` | 認證與傳輸紀錄（JSON Lines）：誰（裝置 ID）、從哪（IP:port）、動了什麼（路徑、位元組數） |
 | `daemon.lock` / `daemon.pid` | 標記資料目錄的唯一擁有者 |
 
 ## 安全模型
@@ -54,7 +54,26 @@ daemon.stop(); // 先把進行中的傳輸 drain 完，再停止
 - 信任的裝置**釘選公鑰**；公鑰換了就以 `peer key changed since pairing` 拒絕。
 - 取消信任（`device rm`）立即生效：下一次認證會重新讀 `trust.json`。
 - 所有遠端路徑都經過 `guard::resolve`，拒絕 `..`、絕對路徑與 `<name>.dtu-part`。
+- 一次性配對碼也必須帶身分：22 字元 base64url 的 ID、可解析的公鑰，且不得冒用已被釘選成其他公鑰的 ID。不合格的連線在寫日誌前就被拒絕（並以 `deny` 連同位址記錄）。
 - REST 需要 `Authorization: Bearer <control.token>`（或 `?t=`）。因為不提供任何頁面，瀏覽器沒有可直接攻擊的介面。
+
+## 稽核日誌
+
+每個事件一行：連線的認證，以及真正搬動過的檔案（JSON Lines，1 MiB 兩代輪替）。
+
+| event | method | 記錄內容 |
+| --- | --- | --- |
+| `auth` | `jwt` / `code` / `session` / `unlimit` | 誰（device）從哪（addr）通過，或為何被拒 |
+| `file` | `put` / `get` / `del` | 對端的 device 與 addr、`path`、`bytes`、結果 |
+| `invite` | `invite` | pending / ok / deny / timeout |
+| `diag` | `-` | panic 等致命錯誤 |
+
+```json
+{"ts":"2026-10-30T09:12:03Z","epoch":1793351523,"event":"file","result":"ok","method":"put","device":"0tZr635ykNqC3_eYOsNnPQ","addr":"192.168.1.24:54712","path":"in/report.pdf","bytes":24117248,"reason":null}
+```
+
+三種讀法：`dtu log --event file`（CLI）、`GET /api/log?event=file`（REST）、TUI / GUI 的 log 分頁。
+它記錄的是「誰搬動了什麼」，不是檔案清單。
 
 ## 傳輸流程
 
