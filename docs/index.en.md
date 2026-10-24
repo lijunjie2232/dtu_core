@@ -45,7 +45,7 @@ Two processes cannot share one data directory: the second `embed::host()` fails 
 | `trust.json` | trusted devices, pinned public keys, the JWT each peer issued |
 | `config.json` | port, served root, parallelism, … |
 | `control.token` | local key for the REST surface (minted once, then reused) |
-| `auth.log` | auth decisions as JSON Lines (transfers are not logged) |
+| `auth.log` | auth decisions **and** transferred files (JSON Lines): who (device id), from where (IP:port), what (path, bytes) |
 | `daemon.lock` / `daemon.pid` | marks the single owner of the data directory |
 
 ## Security model
@@ -54,7 +54,26 @@ Two processes cannot share one data directory: the second `embed::host()` fails 
 - Trusted devices are **pinned by public key**; a changed key is refused with `peer key changed since pairing`.
 - Revocation (`device rm`) applies immediately: the next auth reloads `trust.json`.
 - Every remote path goes through `guard::resolve`, which rejects `..`, absolute paths and `<name>.dtu-part`.
+- A one-time code still needs an identity: a 22-character base64url id, a parsable key, and no claiming an id that is already pinned with another key. Anything else is refused before it can write to the log (and is logged as `deny` with its address).
 - REST needs `Authorization: Bearer <control.token>` (or `?t=`). Since no page is served, there is no browser-facing surface.
+
+## Audit log
+
+One line per event: the auth of a connection, and every file that actually moved (JSON Lines, two generations rotated at 1 MiB).
+
+| event | method | Records |
+| --- | --- | --- |
+| `auth` | `jwt` / `code` / `session` / `unlimit` | who (device) got in from where (addr), or why not |
+| `file` | `put` / `get` / `del` | the peer's device and addr, `path`, `bytes`, result |
+| `invite` | `invite` | pending / ok / deny / timeout |
+| `diag` | `-` | panics and fatal startup errors |
+
+```json
+{"ts":"2026-10-30T09:12:03Z","epoch":1793351523,"event":"file","result":"ok","method":"put","device":"0tZr635ykNqC3_eYOsNnPQ","addr":"192.168.1.24:54712","path":"in/report.pdf","bytes":24117248,"reason":null}
+```
+
+Read it with `dtu log --event file` (CLI), `GET /api/log?event=file` (REST), or the log tab in the TUI / GUI.
+It is a record of who moved what — not a file inventory.
 
 ## How a transfer runs
 
