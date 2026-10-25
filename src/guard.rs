@@ -24,6 +24,19 @@ fn is_part(name: &std::ffi::OsStr) -> bool {
 /// Map a wire path (forward slashes, relative) to a real path guaranteed under `root`.
 pub fn resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel = rel.replace('\\', "/");
+    // The wire path is host independent, so a drive prefix (`C:`, `C:/…`) or a UNC
+    // prefix is a client bug on any server. Left to `Path::components` it is a prefix
+    // on Windows but a plain (oddly named) directory on Unix — refuse it everywhere.
+    // `a:b.txt` stays legal on Unix: it only looks like a drive when a separator or
+    // the end of the path follows the colon.
+    let head = rel.as_bytes();
+    let drive = head.len() >= 2
+        && head[0].is_ascii_alphabetic()
+        && head[1] == b':'
+        && (head.len() == 2 || head[2] == b'/');
+    if drive || rel.starts_with("//") {
+        return Err(format!("illegal path component in {rel:?}"));
+    }
     let mut out = PathBuf::new();
     for c in Path::new(&rel).components() {
         match c {
