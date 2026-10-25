@@ -435,7 +435,9 @@ async fn path_guard_blocks_every_escape_it_can() {
     ] {
         proto::write_msg(&mut s, &Msg::List { path: bad.into() }).await.unwrap();
         let msg = expect_err(&mut s).await;
-        assert!(msg.contains("path"), "{bad:?} gave {msg}");
+        // "illegal", not "no such path": the guard must refuse these on every OS,
+        // not merely fail to find them.
+        assert!(msg.contains("illegal path"), "{bad:?} gave {msg}");
     }
 
     // normal relative paths still work through the same connection
