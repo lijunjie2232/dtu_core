@@ -160,7 +160,7 @@ mod tests {
     fn rejects_escapes() {
         let root = std::env::temp_dir().join("dtu-guard-root");
         std::fs::create_dir_all(&root).unwrap();
-        for bad in ["../x", "a/../../b", "C:\\Windows\\system32", "/etc/passwd", ".."] {
+        for bad in ["../x", "a/../../b", "C:\\Windows\\system32", "/etc/passwd", "..", "\\\\server\\share"] {
             assert!(resolve(&root, bad).is_err(), "should reject {bad:?}");
         }
         assert!(resolve(&root, "a/b.txt").is_ok());
