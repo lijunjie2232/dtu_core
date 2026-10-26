@@ -53,7 +53,7 @@ Two processes cannot share one data directory: the second `embed::host()` fails 
 - One auth per TCP connection (not per file), done in the `Hello` frame with a JWT, a one-time code, or a session token.
 - Trusted devices are **pinned by public key**; a changed key is refused with `peer key changed since pairing`.
 - Revocation (`device rm`) applies immediately: the next auth reloads `trust.json`.
-- Every remote path goes through `guard::resolve`, which rejects `..`, absolute paths and `<name>.dtu-part`.
+- Every remote path goes through `guard::resolve`, which rejects `..`, absolute paths and `<name>.dtu-part`. Drive (`C:`, `C:/…`) and UNC (`\\host\…`) prefixes are refused whatever OS the server runs on.
 - A one-time code still needs an identity: a 22-character base64url id, a parsable key, and no claiming an id that is already pinned with another key. Anything else is refused before it can write to the log (and is logged as `deny` with its address).
 - REST needs `Authorization: Bearer <control.token>` (or `?t=`). Since no page is served, there is no browser-facing surface.
 
