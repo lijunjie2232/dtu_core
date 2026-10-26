@@ -21,7 +21,7 @@ It has no binary and no daemon of its own: `dtu_cli`, `dtu_tui`, `dtu_gui` — o
 
 ```toml
 [dependencies]
-dtu_core = { path = "../dtu_core" }
+dtu_core = { git = "https://github.com/lijunjie2232/dtu_core.git", tag = "vx.y.z" }
 ```
 
 ```rust
