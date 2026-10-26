@@ -53,7 +53,7 @@ daemon.stop(); // 先把進行中的傳輸 drain 完，再停止
 - 每條 TCP 連線認證一次（不是每個檔案），在 `Hello` 訊框裡帶 JWT、一次性配對碼或 session token。
 - 信任的裝置**釘選公鑰**；公鑰換了就以 `peer key changed since pairing` 拒絕。
 - 取消信任（`device rm`）立即生效：下一次認證會重新讀 `trust.json`。
-- 所有遠端路徑都經過 `guard::resolve`，拒絕 `..`、絕對路徑與 `<name>.dtu-part`。
+- 所有遠端路徑都經過 `guard::resolve`，拒絕 `..`、絕對路徑與 `<name>.dtu-part`。磁碟機（`C:` / `C:/…`）與 UNC（`\\host\…`）前置詞一律拒絕，與伺服器作業系統無關。
 - 一次性配對碼也必須帶身分：22 字元 base64url 的 ID、可解析的公鑰，且不得冒用已被釘選成其他公鑰的 ID。不合格的連線在寫日誌前就被拒絕（並以 `deny` 連同位址記錄）。
 - REST 需要 `Authorization: Bearer <control.token>`（或 `?t=`）。因為不提供任何頁面，瀏覽器沒有可直接攻擊的介面。
 
