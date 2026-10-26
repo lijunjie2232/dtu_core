@@ -21,7 +21,7 @@
 
 ```toml
 [dependencies]
-dtu_core = { path = "../dtu_core" }
+dtu_core = { git = "https://github.com/lijunjie2232/dtu_core.git", tag = "vx.y.z" }
 ```
 
 ```rust
