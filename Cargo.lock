@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "dtu_core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "ed25519-dalek",

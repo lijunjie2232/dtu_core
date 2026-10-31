@@ -1,6 +1,6 @@
 [package]
 name = "dtu_core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "dtu core: identity, trust, transfer protocol, daemon and the REST control surface"
 
